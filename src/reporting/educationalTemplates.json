@@ -1,0 +1,77 @@
+{
+  "education": {
+    "SQLI_GENERIC": {
+      "title": "SQL Injection (Umum)",
+      "explanation": "Aplikasi membangun query SQL dari input pengguna tanpa pemisahan parameter. Akibatnya, penyerang bisa menyisipkan perintah SQL berbahaya.",
+      "impact": "Data sensitif bisa dibaca, diubah, atau dihapus.",
+      "recommendations": [
+        "Gunakan query terparameter (prepared statements), jangan gabung string SQL manual.",
+        "Batasi format input (contoh: angka untuk ID, enum untuk role).",
+        "Gunakan akun database dengan hak akses minimum (least privilege)."
+      ],
+      "fixSnippet": "// ❌ Jangan gabung string query langsung dari input user\n// const query = `UPDATE users SET role='${newRole}' WHERE id=${userId}`;\n\n// ✅ Gunakan parameterized query\nconst query = 'UPDATE users SET role = ? WHERE id = ?';\ndb.query(query, [newRole, userId], (err, result) => {\n  if (err) return next(err);\n  res.json({ status: 'updated' });\n});",
+      "references": ["https://owasp.org/www-community/attacks/SQL_Injection"]
+    },
+    "SQLI_UNION": {
+      "title": "UNION-Based SQL Injection",
+      "explanation": "Serangan UNION memungkinkan penyerang menggabungkan query tambahan untuk membaca data dari tabel lain secara tidak sah.",
+      "impact": "Kebocoran data database secara luas.",
+      "recommendations": [
+        "Gunakan parameterized query untuk semua input user.",
+        "Hindari menampilkan error SQL mentah ke pengguna.",
+        "Validasi input dengan whitelist sesuai skema yang diharapkan."
+      ],
+      "fixSnippet": "const query = 'SELECT id, name FROM users WHERE email = ?';\ndb.query(query, [email], (err, rows) => {\n  if (err) return next(err);\n  res.json(rows);\n});",
+      "references": ["https://owasp.org/www-community/attacks/SQL_Injection"]
+    },
+    "SQLI_TIME": {
+      "title": "Time-Based SQL Injection",
+      "explanation": "Penyerang memakai fungsi delay database (misalnya SLEEP) untuk menebak isi data dari jeda respons aplikasi.",
+      "impact": "Pengungkapan data secara bertahap melalui analisis waktu.",
+      "recommendations": [
+        "Gunakan parameterized query agar input tidak dieksekusi sebagai SQL.",
+        "Tetapkan batas waktu query dan monitoring anomali latency.",
+        "Validasi input numerik/string sesuai aturan yang ketat."
+      ],
+      "fixSnippet": "const query = 'SELECT * FROM products WHERE id = ?';\ndb.query(query, [productId], (err, rows) => {\n  if (err) return next(err);\n  res.json(rows);\n});"
+    },
+    "XSS_GENERIC": {
+      "title": "Cross-Site Scripting (Umum)",
+      "explanation": "Input dari pengguna diproses ke output HTML tanpa encoding/sanitasi yang memadai. Ini memungkinkan script berbahaya dijalankan di browser korban.",
+      "impact": "Pencurian cookie/session, deface konten, atau aksi atas nama pengguna.",
+      "recommendations": [
+        "Selalu lakukan encoding output sesuai konteks (HTML, attribute, URL, JS).",
+        "Gunakan library sanitasi bila harus merender HTML dari user.",
+        "Aktifkan Content Security Policy (CSP) untuk mengurangi dampak XSS."
+      ],
+      "fixSnippet": "// ❌ Jangan kirim input user mentah ke HTML\n// res.send(`<h1>${req.query.name}</h1>`);\n\n// ✅ Escape/encode output user\nconst escapeHtml = (value) => String(value)\n  .replace(/&/g, '&amp;')\n  .replace(/</g, '&lt;')\n  .replace(/>/g, '&gt;')\n  .replace(/\"/g, '&quot;')\n  .replace(/'/g, '&#39;');\n\nres.send(`<h1>${escapeHtml(req.query.name)}</h1>`);"
+    },
+    "XSS_REFLECTED": {
+      "title": "Reflected XSS",
+      "explanation": "Input pengguna langsung dipantulkan ke halaman tanpa encoding, sehingga script berbahaya bisa langsung dieksekusi.",
+      "impact": "Pembajakan sesi dan pencurian kredensial pengguna.",
+      "recommendations": [
+        "Encode semua input pengguna sebelum dirender.",
+        "Validasi parameter URL agar hanya menerima format aman.",
+        "Tambahkan CSP dan HTTPOnly pada cookie sesi."
+      ],
+      "fixSnippet": "const safeQuery = escapeHtml(req.query.q || '');\nres.send(`<p>Hasil pencarian: ${safeQuery}</p>`);"
+    },
+    "XSS_STORED": {
+      "title": "Stored XSS",
+      "explanation": "Input berbahaya tersimpan di database lalu dieksekusi saat ditampilkan ke banyak pengguna.",
+      "impact": "Kompromi jangka panjang yang bisa memengaruhi seluruh pengguna.",
+      "recommendations": [
+        "Sanitasi data saat disimpan dan tetap encode saat ditampilkan.",
+        "Pisahkan data teks biasa dari HTML yang diizinkan.",
+        "Audit konten lama untuk membersihkan payload berbahaya."
+      ],
+      "fixSnippet": "const sanitizedComment = sanitizeHtml(req.body.comment);\nawait db.saveComment(sanitizedComment);\n\nconst safeComment = escapeHtml(commentFromDb);\nres.send(`<div>${safeComment}</div>`);"
+    }
+  },
+  "remediation": {
+    "general": "Review affected code, apply patches, implement code review, provide security training",
+    "sqlInjection": "Use parameterized queries, input validation, least privilege, WAF, regular testing",
+    "xss": "Encode user input, use Security Headers (CSP), sanitize HTML, use templating with auto-escaping"
+  }
+}

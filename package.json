@@ -1,0 +1,45 @@
+{
+  "name": "securecli",
+  "version": "1.0.0",
+  "description": "Hybrid SAST CLI Scanner - Professional Vulnerability Detection Engine",
+  "main": "src/core/orchestrator.js",
+  "bin": {
+    "securecli": "bin/securecli.js"
+  },
+  "scripts": {
+    "start": "node bin/securecli.js",
+    "test": "jest --coverage",
+    "test:regex": "jest tests/regex.test.js",
+    "test:taint": "jest tests/taint.test.js",
+    "test:scoring": "jest tests/scoring.test.js",
+    "lint": "eslint src/**/*.js",
+    "scan:examples": "node bin/securecli.js --verbose examples"
+  },
+  "keywords": [
+    "sast",
+    "security",
+    "vulnerability",
+    "scanner",
+    "static-analysis",
+    "sqli",
+    "xss",
+    "injection"
+  ],
+  "author": "Security Research Team",
+  "license": "MIT",
+  "dependencies": {
+    "acorn": "^8.11.3",
+    "acorn-walk": "^8.3.2"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0",
+    "eslint": "^8.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/security-team/securecli"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
