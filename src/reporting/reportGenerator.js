@@ -120,23 +120,100 @@ class ReportGenerator {
     report += `💡 Rekomendasi:\n`;
     report += this.formatRecommendations(education) + '\n';
 
-    report += this.formatFixSnippet(education);
+    // Context-aware fix (if available from template engine)
+    if (finding.contextAwareFix) {
+      report += this.formatContextAwareFix(finding.contextAwareFix);
+    } else {
+      report += this.formatFixSnippet(education);
+    }
 
     return report;
   }
 
   /**
-   * Generate JSON report
+   * Format context-aware fix snippet (PHASE 3 & 4 integration)
+   */
+  formatContextAwareFix(fix) {
+    if (!fix) return '';
+
+    let output = `🔧 Context-Aware Fix (${fix.name}):\n\n`;
+    output += `   ${fix.description}\n\n`;
+    output += `   Confidence: ${(fix.confidence * 100).toFixed(0)}%\n\n`;
+    output += `🛠️  Recommended Code:\n\n\`\`\`\n${fix.code}\n\`\`\`\n\n`;
+    
+    if (fix.example && fix.example !== fix.code) {
+      output += `📖 Example:\n\n\`\`\`\n${fix.example}\n\`\`\`\n\n`;
+    }
+
+    return output;
+  }
+
+  /**
+   * Generate JSON report (PHASE 4: Structured Output)
    */
   generateJSONReport(findings) {
     return JSON.stringify(
-      findings.map(finding => ({
-        ...finding,
-        owasp: getOWASPMapping(finding.type),
-      })),
+      findings.map(finding => this.generateStructuredFinding(finding)),
       null,
       2
     );
+  }
+
+  /**
+   * Generate structured finding with complete information
+   * PHASE 4: Complete structured JSON output
+   */
+  generateStructuredFinding(finding) {
+    const owasp = getOWASPMapping(finding.type);
+    const education = this.getEducationTemplate(finding.type);
+
+    return {
+      // Core vulnerability info
+      vulnerability: finding.name || finding.type,
+      type: finding.type,
+      severity: finding.severity,
+      confidence: finding.confidence || 0.8,
+      
+      // Location info
+      file: finding.file,
+      line: finding.line,
+      
+      // Detection info
+      engine: finding.engine,
+      flow: finding.flow,
+      
+      // Risk assessment
+      riskScore: finding.riskScore,
+      exploitability: finding.exploitability,
+      
+      // Code context
+      originalCode: finding.code || '',
+      codeContext: finding.codeContext || null,
+      
+      // Classification
+      owasp: {
+        category: owasp.category,
+        cwe: owasp.cwe,
+        rank: owasp.rank || null,
+      },
+      
+      // Educational content
+      explanation: education?.explanation || 'Vulnerability detected',
+      impact: education?.impact || 'Security risk',
+      
+      // Remediation (from template engine if available)
+      remediation: finding.remediation || {
+        description: education?.explanation || 'Follow security best practices',
+        recommendations: education?.recommendations || [],
+        fixSnippet: education?.fixSnippet || null,
+      },
+      
+      // Context-aware fix (if available from context analyzer + template engine)
+      contextAwareFix: finding.contextAwareFix || null,
+      
+      // Metadata
+      timestamp: new Date().toISOString(),
+    };
   }
 
   /**

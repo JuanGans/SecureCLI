@@ -103,17 +103,83 @@ class TaintAnalyzer {
           const argName = this.getFullName(arg);
           const rawCode = code.slice(arg.start, arg.end);
 
+          // Enhanced: Detect API context
+          const apiContext = this.detectAPIContext(node, calleeName);
+          const vulnerabilityType = this.detectVulnerabilityType(calleeName);
+
           this.findings.push({
             engine: 'taint',
             sink: calleeName,
+            sinkFunction: calleeName,
             source: argName,
+            sourceVar: argName,
             line: node.loc.start.line,
             flow: `${argName} → ${calleeName}`,
             code: rawCode,
+            sanitized: false,
+            // Context-aware fields
+            apiContext: apiContext,
+            vulnerabilityType: vulnerabilityType,
+            connectionVar: this.extractConnectionVar(node),
+            astNode: node, // Store for later context analysis
           });
         }
       });
     }
+  }
+
+  /**
+   * Detect API context from sink function name
+   */
+  detectAPIContext(node, sinkName) {
+    if (sinkName.includes('mysqli_query') || sinkName.includes('mysqli')) {
+      return { api: 'mysqli', type: 'procedural' };
+    }
+    if (sinkName.includes('PDO') || sinkName.includes('prepare')) {
+      return { api: 'PDO', type: 'object' };
+    }
+    if (sinkName.includes('query') && sinkName.includes('.')) {
+      // db.query, connection.query, etc.
+      return { api: 'generic_sql', type: 'object' };
+    }
+    if (sinkName.includes('innerHTML')) {
+      return { api: 'DOM', type: 'innerHTML' };
+    }
+    if (sinkName.includes('textContent') || sinkName.includes('innerText')) {
+      return { api: 'DOM', type: 'textContent' };
+    }
+    if (sinkName.includes('document.write') || sinkName.includes('write')) {
+      return { api: 'DOM', type: 'write' };
+    }
+    return { api: 'unknown', type: 'unknown' };
+  }
+
+  /**
+   * Detect vulnerability type from sink
+   */
+  detectVulnerabilityType(sinkName) {
+    const sqlKeywords = ['query', 'mysqli', 'PDO', 'execute', 'prepare'];
+    const xssKeywords = ['innerHTML', 'write', 'send', 'eval', 'setTimeout'];
+
+    if (sqlKeywords.some(kw => sinkName.includes(kw))) {
+      return 'SQLI';
+    }
+    if (xssKeywords.some(kw => sinkName.includes(kw))) {
+      return 'XSS';
+    }
+    return 'UNKNOWN';
+  }
+
+  /**
+   * Extract database connection variable from call expression
+   * Example: conn.query(...) -> returns 'conn'
+   */
+  extractConnectionVar(node) {
+    if (node.callee && node.callee.type === 'MemberExpression') {
+      const objName = this.getFullName(node.callee.object);
+      return objName || null;
+    }
+    return null;
   }
 
   /**

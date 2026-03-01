@@ -1,0 +1,96 @@
+{
+  "sqli": {
+    "mysqli_prepared": {
+      "name": "MySQL Prepared Statement (mysqli)",
+      "description": "Gunakan prepared statement dengan bind_param untuk mencegah SQL Injection pada mysqli extension.",
+      "template": "$stmt = {{conn}}->prepare(\"SELECT * FROM {{table}} WHERE {{column}} = ?\");\n$stmt->bind_param(\"{{type}}\", {{var}});\n$stmt->execute();\n$result = $stmt->get_result();",
+      "placeholders": {
+        "conn": "Database connection variable (default: $conn)",
+        "table": "Table name (default: users)",
+        "column": "Column name (default: id)",
+        "type": "Parameter type: i=integer, s=string, d=double, b=blob (default: i)",
+        "var": "User input variable"
+      },
+      "example": "$stmt = $conn->prepare(\"SELECT * FROM users WHERE id = ?\");\n$stmt->bind_param(\"i\", $userInput);\n$stmt->execute();\n$result = $stmt->get_result();"
+    },
+    "pdo_prepared": {
+      "name": "PDO Prepared Statement",
+      "description": "Gunakan prepared statement dengan PDO untuk mencegah SQL Injection.",
+      "template": "$stmt = {{conn}}->prepare(\"SELECT * FROM {{table}} WHERE {{column}} = :{{param}}\");\n$stmt->bindParam(':{{param}}', {{var}}, PDO::PARAM_{{pdoType}});\n$stmt->execute();",
+      "placeholders": {
+        "conn": "PDO connection variable (default: $pdo)",
+        "table": "Table name (default: users)",
+        "column": "Column name (default: id)",
+        "param": "Named parameter (default: id)",
+        "pdoType": "PDO type: INT, STR, BOOL (default: INT)",
+        "var": "User input variable"
+      },
+      "example": "$stmt = $pdo->prepare(\"SELECT * FROM users WHERE id = :id\");\n$stmt->bindParam(':id', $userId, PDO::PARAM_INT);\n$stmt->execute();"
+    },
+    "orm_parameterized": {
+      "name": "ORM Parameterized Query",
+      "description": "Gunakan parameterized query pada ORM/Query Builder untuk keamanan.",
+      "template": "const result = await {{conn}}.query(\"SELECT * FROM {{table}} WHERE {{column}} = $1\", [{{var}}]);",
+      "placeholders": {
+        "conn": "Database connection/client (default: db)",
+        "table": "Table name (default: users)",
+        "column": "Column name (default: id)",
+        "var": "User input variable"
+      },
+      "example": "const result = await db.query(\"SELECT * FROM users WHERE id = $1\", [userId]);"
+    },
+    "generic_prepared_statement": {
+      "name": "Generic Prepared Statement",
+      "description": "Gunakan prepared statement sesuai database API yang Anda gunakan.",
+      "template": "// Contoh dengan prepared statement:\n$stmt = {{conn}}->prepare(\"SELECT * FROM {{table}} WHERE {{column}} = ?\");\n$stmt->execute([{{var}}]);",
+      "placeholders": {
+        "conn": "Database connection (default: $conn)",
+        "table": "Table name (default: users)",
+        "column": "Column name (default: id)",
+        "var": "User input variable"
+      },
+      "example": "$stmt = $conn->prepare(\"SELECT * FROM users WHERE id = ?\");\n$stmt->execute([$userId]);"
+    }
+  },
+  "xss": {
+    "textContent_replacement": {
+      "name": "Ganti innerHTML dengan textContent",
+      "description": "Gunakan textContent atau innerText untuk mencegah XSS, karena tidak akan mengeksekusi HTML/JavaScript.",
+      "template": "// UNSAFE:\n// {{element}}.innerHTML = {{var}};\n\n// SAFE:\n{{element}}.textContent = {{var}};",
+      "placeholders": {
+        "element": "DOM element variable",
+        "var": "User input variable"
+      },
+      "example": "// UNSAFE:\n// element.innerHTML = userInput;\n\n// SAFE:\nelement.textContent = userInput;"
+    },
+    "safe_encoding": {
+      "name": "Encode Output dengan htmlspecialchars",
+      "description": "Encode user input sebelum output untuk mencegah XSS.",
+      "template": "// PHP example:\necho htmlspecialchars({{var}}, ENT_QUOTES, 'UTF-8');\n\n// JavaScript example:\nconst safeOutput = {{var}}.replace(/[<>\"'&]/g, (char) => ({\n  '<': '&lt;',\n  '>': '&gt;',\n  '\"': '&quot;',\n  \"'\": '&#x27;',\n  '&': '&amp;'\n}[char]));",
+      "placeholders": {
+        "var": "User input variable"
+      },
+      "example": "echo htmlspecialchars($userInput, ENT_QUOTES, 'UTF-8');"
+    },
+    "generic_escape": {
+      "name": "Escape User Input",
+      "description": "Selalu escape/encode user input sebelum menampilkan ke halaman.",
+      "template": "// Escape karakter berbahaya:\nconst safe{{Var}} = {{var}}.replace(/[<>\"'&]/g, (char) => ({\n  '<': '&lt;',\n  '>': '&gt;',\n  '\"': '&quot;',\n  \"'\": '&#x27;',\n  '&': '&amp;'\n}[char]));\n\ndocument.write(safe{{Var}});",
+      "placeholders": {
+        "var": "User input variable (lowercase)",
+        "Var": "User input variable (capitalized)"
+      },
+      "example": "const safeInput = userInput.replace(/[<>\"'&]/g, (char) => ({\n  '<': '&lt;',\n  '>': '&gt;',\n  '\"': '&quot;',\n  \"'\": '&#x27;',\n  '&': '&amp;'\n}[char]));\n\ndocument.write(safeInput);"
+    },
+    "already_safe": {
+      "name": "Metode Aman (Verify Context)",
+      "description": "textContent/innerText sudah aman dari XSS, tapi pastikan tidak ada konteks lain yang vulnerable.",
+      "template": "// textContent sudah aman:\n{{element}}.textContent = {{var}};\n\n// Pastikan tidak ada kode lain yang vulnerable",
+      "placeholders": {
+        "element": "DOM element",
+        "var": "User input variable"
+      },
+      "example": "element.textContent = userInput; // Already safe"
+    }
+  }
+}
