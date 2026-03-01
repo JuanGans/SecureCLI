@@ -40,12 +40,39 @@ class ReportGenerator {
     ].join('\n') + '\n';
   }
 
-  formatFixSnippet(education) {
+  formatFixSnippet(education, language = 'javascript') {
     if (!education?.fixSnippet) {
       return '';
     }
 
-    return `🛠️  Snippet Perbaikan:\n\n\`\`\`javascript\n${education.fixSnippet}\n\`\`\`\n\n`;
+    // Generate language-appropriate snippet
+    let snippet = education.fixSnippet;
+    let codeLanguage = 'javascript';
+    
+    // If scanning PHP, generate PHP-specific snippet
+    if (language === 'php') {
+      codeLanguage = 'php';
+      snippet = this.getPHPFixSnippet(education);
+    }
+
+    return `🛠️  Snippet Perbaikan:\n\n\`\`\`${codeLanguage}\n${snippet}\n\`\`\`\n\n`;
+  }
+
+  /**
+   * Get PHP-specific fix snippets
+   */
+  getPHPFixSnippet(education) {
+    // Map education types to PHP fixes
+    if (education.title?.includes('SQL')) {
+      return `// ❌ Jangan gabung string query langsung dari input user\n// $query = "UPDATE users SET role='$newRole' WHERE id=$userId";\n\n// ✅ Gunakan prepared statement dengan mysqli\n$stmt = $conn->prepare("UPDATE users SET role = ? WHERE id = ?");\n$stmt->bind_param("si", $newRole, $userId);\n$stmt->execute();\n$stmt->close();\n\n// ATAU gunakan PDO dengan named parameters\n$stmt = $pdo->prepare("UPDATE users SET role = :role WHERE id = :id");\n$stmt->execute(['role' => $newRole, 'id' => $userId]);`;
+    }
+    
+    if (education.title?.includes('XSS') || education.title?.includes('Cross-Site')) {
+      return `// ❌ Jangan echo input user langsung\n// echo "<h1>Hello " . $_GET['name'] . "</h1>";\n\n// ✅ Escape output dengan htmlspecialchars\n$safeName = htmlspecialchars($_GET['name'], ENT_QUOTES, 'UTF-8');\necho "<h1>Hello " . $safeName . "</h1>";\n\n// ATAU gunakan framework escaping (Laravel, Symfony, dll)\n// Blade: {{ $name }} - auto-escaped\n// Twig: {{ name }} - auto-escaped`;
+    }
+    
+    // Default generic PHP fix
+    return education.fixSnippet;
   }
 
   /**
@@ -66,7 +93,20 @@ class ReportGenerator {
    */
   generateFindingReport(finding, sourceCode, filePath, index) {
     const owasp = getOWASPMapping(finding.type);
+    
+    // Use CWE from finding if available (from scanner's CWE mapping)
+    // Otherwise fallback to OWASP mapper
+    const cweInfo = finding.cwe ? {
+      category: owasp.category,
+      cwe: finding.cwe,
+      cweName: finding.cweName,
+      cweUrl: finding.cweUrl
+    } : owasp;
+    
     const education = this.getEducationTemplate(finding.type);
+    
+    // Detect language from file path
+    const language = filePath.endsWith('.php') ? 'php' : 'javascript';
 
     let report = '\n' + '='.repeat(60) + '\n';
     report += `🔴 VULNERABILITY #${index}\n`;
@@ -87,8 +127,8 @@ class ReportGenerator {
 
     // OWASP Classification
     report += `🏛️  OWASP Classification:\n`;
-    report += `   Category: ${owasp.category}\n`;
-    report += `   CWE: ${owasp.cwe}\n\n`;
+    report += `   Category: ${cweInfo.category}\n`;
+    report += `   CWE: ${cweInfo.cwe}\n\n`;
 
     // Code context
     if (sourceCode) {
@@ -124,7 +164,7 @@ class ReportGenerator {
     if (finding.contextAwareFix) {
       report += this.formatContextAwareFix(finding.contextAwareFix);
     } else {
-      report += this.formatFixSnippet(education);
+      report += this.formatFixSnippet(education, language);
     }
 
     return report;

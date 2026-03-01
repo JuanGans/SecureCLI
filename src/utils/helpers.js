@@ -2,6 +2,89 @@
  * Utility helper functions
  */
 
+const path = require('path');
+
+/**
+ * Detect programming language from file extension
+ */
+function detectLanguage(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  
+  const languageMap = {
+    '.js': 'javascript',
+    '.jsx': 'javascript',
+    '.ts': 'typescript',
+    '.tsx': 'typescript',
+    '.php': 'php',
+    '.php3': 'php',
+    '.php4': 'php',
+    '.php5': 'php',
+    '.phtml': 'php',
+    '.py': 'python',
+    '.rb': 'ruby',
+    '.java': 'java'
+  };
+  
+  return languageMap[ext] || 'unknown';
+}
+
+/**
+ * Check if line is in documentation/comment context
+ */
+function isInDocumentation(code, lineNumber) {
+  const lines = code.split('\n');
+  const line = lines[lineNumber - 1];
+  
+  if (!line) return false;
+  
+  // Check if line is in comment
+  const trimmed = line.trim();
+  if (trimmed.startsWith('//') || 
+      trimmed.startsWith('*') || 
+      trimmed.startsWith('/*') ||
+      trimmed.includes('<!--')) {
+    return true;
+  }
+  
+  // Only flag <pre>/<code> if they're in comments or actual help files
+  if (/help\.php/i.test(line)) return true;
+  if (trimmed.startsWith('//') && (/<pre>/i.test(line) || /<code>/i.test(line))) return true;
+  
+  // Check for clear documentation patterns
+  const docPatterns = [
+    /spoiler/i,
+    /example.*code/i,
+    /demo.*code/i,
+    /how.*exploit/i,
+    /documentation/i,
+    /this shows/i
+  ];
+  
+  return docPatterns.some(pattern => pattern.test(line));
+}
+
+/**
+ * Check if code is hardcoded (not user input)
+ */
+function isHardcoded(code, lineNumber) {
+  const lines = code.split('\n');
+  const line = lines[lineNumber - 1];
+  
+  if (!line) return false;
+  
+  // Check for hardcoded patterns
+  const hardcodedPatterns = [
+    /onclick=["']javascript:[^"']*["']/i,  // onclick with hardcoded js
+    /window\.opener/i,  // popup code
+    /window\.close/i,
+    /self\.close/i,
+    /<input[^>]+type=["'](text|submit|button)["'][^>]*>/i,  // Normal form inputs
+    /value=["'][^"']*["']/  // Inputs with hardcoded values
+  ];
+  
+  return hardcodedPatterns.some(pattern => pattern.test(line));
+}
+
 /**
  * Get line content from source code
  */
@@ -68,6 +151,9 @@ function parseArgs(argv) {
 }
 
 module.exports = {
+  detectLanguage,
+  isInDocumentation,
+  isHardcoded,
   getLineContent,
   getContextLines,
   sanitizePath,

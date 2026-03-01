@@ -31,6 +31,14 @@ class RiskScorer {
       confidence = 0.85;
     } else if (detectionMethod === 'ast') {
       confidence = 0.9;
+    } else if (detectionMethod === 'taint+regex' || detectionMethod === 'TAINT_ANALYSIS') {
+      // Multi-engine or proven taint analysis
+      confidence = 0.92;
+    } else if (detectionMethod === 'hybrid') {
+      confidence = 0.88;
+    } else {
+      // Default for unknown engines (shouldn't happen but safe fallback)
+      confidence = 0.6;
     }
 
     // Adjust by additional factors
