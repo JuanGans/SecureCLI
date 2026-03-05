@@ -270,6 +270,7 @@ class ReportGenerator {
       },
       byType: {},
       byEngine: {
+        hybrid: 0,
         regex: 0,
         taint: 0,
         ast: 0,
@@ -277,9 +278,22 @@ class ReportGenerator {
     };
 
     findings.forEach(finding => {
-      stats.bySeverity[finding.severity]++;
+      stats.bySeverity[finding.severity] = (stats.bySeverity[finding.severity] || 0) + 1;
       stats.byType[finding.type] = (stats.byType[finding.type] || 0) + 1;
-      stats.byEngine[finding.engine]++;
+
+      const rawEngine = (finding.engine || 'unknown').toLowerCase();
+
+      if (rawEngine.includes('+')) {
+        stats.byEngine.hybrid++;
+      } else if (rawEngine.includes('regex')) {
+        stats.byEngine.regex++;
+      } else if (rawEngine.includes('taint')) {
+        stats.byEngine.taint++;
+      } else if (rawEngine.includes('ast')) {
+        stats.byEngine.ast++;
+      } else {
+        stats.byEngine[rawEngine] = (stats.byEngine[rawEngine] || 0) + 1;
+      }
     });
 
     return stats;
