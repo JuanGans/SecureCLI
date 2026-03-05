@@ -23,6 +23,7 @@ const AdaptiveFixGenerator = require('../remediation/adaptiveFixGenerator');
 // NEW: Multi-engine detection for improved accuracy
 const MultiEngineDetector = require('../engines/multiEngineDetector');
 const PHPTaintAnalyzer = require('../engines/taint/phpTaintAnalyzer');
+const PHPTokenizer = require('../engines/ast/phpTokenizer');
 
 class Scanner {
   constructor(options = {}) {
@@ -30,6 +31,7 @@ class Scanner {
     this.regexEngine = new RegexEngine();
     this.taintAnalyzer = new TaintAnalyzer();
     this.phpTaintAnalyzer = new PHPTaintAnalyzer();  // NEW: PHP-specific taint analyzer
+    this.phpTokenizer = new PHPTokenizer();
     this.astEngine = new ASTEngine();
     this.contextAnalyzer = new ContextAnalyzer(this.astEngine);
     this.templateEngine = new TemplateEngine();
@@ -108,7 +110,10 @@ class Scanner {
       });
 
       // LAYER 4: SCORING
-      const scoredFindings = enhancedFindings.map(finding => this.scoreFinding(finding));
+      const scoredFindings = enhancedFindings.map(finding => {
+        const scored = this.scoreFinding(finding);
+        return this.addCWEMapping(scored);
+      });
 
       return scoredFindings;
     } catch (error) {
@@ -130,6 +135,10 @@ class Scanner {
     try {
       // Step 0: Strip comments to avoid false positives
       const cleanedContent = CommentStripper.strip(content, 'php');
+
+      // Step 0.5: Structural analysis (AST/token-based stage for PHP)
+      this.logger.debug(`Running PHP structural analysis on ${filePath}`);
+      const structuralAnalysis = this.analyzePHPStructure(cleanedContent);
       
       // Step 1: Run taint analysis (high confidence, proven chains)
       this.logger.debug(`Running PHP taint analysis on ${filePath}`);
@@ -145,7 +154,8 @@ class Scanner {
         filePath, 
         cleanedContent, 
         taintFindings, 
-        regexFindings
+        regexFindings,
+        structuralAnalysis
       );
 
       // LAYER 2: FILTER FALSE POSITIVES
@@ -183,19 +193,29 @@ class Scanner {
    * 3. Adjust confidence based on engine agreement
    * 4. Remove low-confidence findings that lack proof
    */
-  consolidateDetections(filePath, content, taintFindings, regexFindings) {
+  consolidateDetections(filePath, content, taintFindings, regexFindings, structuralAnalysis = null) {
     const consolidated = [];
     const processedRegexFindings = new Set();
 
     // PHASE 1: Add all taint findings with high confidence
     for (const taintFinding of taintFindings) {
+      const structuralEvidence = this.getStructuralEvidence(taintFinding, structuralAnalysis, content);
+      const engines = ['TAINT_ANALYSIS'];
+
+      if (structuralEvidence.confirmed) {
+        engines.push('AST_STRUCTURAL');
+      }
+
       consolidated.push({
         ...taintFinding,
-        engine: 'taint+regex',
-        engines: ['TAINT_ANALYSIS'],
-        confidence: Math.min(0.98, taintFinding.confidence || 0.95),
+        engine: structuralEvidence.confirmed ? 'taint+regex+ast' : 'taint+regex',
+        engines,
+        confidence: Math.min(0.99, (taintFinding.confidence || 0.95) + (structuralEvidence.confidenceBoost || 0)),
         isProvenVulnerability: true,
-        reason: 'Confirmed by taint analysis - proven data flow from source to sink',
+        reason: structuralEvidence.confirmed
+          ? 'Confirmed by taint analysis with structural validation (AST/token stage)'
+          : 'Confirmed by taint analysis - proven data flow from source to sink',
+        structuralEvidence: structuralEvidence.summary,
         file: filePath
       });
     }
@@ -228,14 +248,24 @@ class Scanner {
         // Only regex detected - include with lower confidence
         // But filter out obvious false positives
         if (!this.isLikelyFalsePositive(regexFinding, content)) {
+          const structuralEvidence = this.getStructuralEvidence(regexFinding, structuralAnalysis, content);
+          const engines = ['REGEX'];
+
+          if (structuralEvidence.confirmed) {
+            engines.push('AST_STRUCTURAL');
+          }
+
           consolidated.push({
             ...regexFinding,
-            engine: 'regex',
-            engines: ['REGEX'],
-            confidence: this.adjustConfidenceForRegexOnly(regexFinding),
+            engine: structuralEvidence.confirmed ? 'regex+ast' : 'regex',
+            engines,
+            confidence: Math.min(0.95, this.adjustConfidenceForRegexOnly(regexFinding) + (structuralEvidence.confidenceBoost || 0)),
             isProvenVulnerability: false,
-            reason: 'Source detected (needs manual verification - not confirmed as sink)',
+            reason: structuralEvidence.confirmed
+              ? 'Pattern detected with structural support (needs taint confirmation)'
+              : 'Source detected (needs manual verification - not confirmed as sink)',
             file: filePath,
+            structuralEvidence: structuralEvidence.summary,
             note: 'Detected by pattern matching only - may require manual verification'
           });
         } else {
@@ -327,6 +357,101 @@ class Scanner {
     }
 
     return adjusted;
+  }
+
+  /**
+   * PHP structural analysis stage (token/AST-like validation)
+   */
+  analyzePHPStructure(content) {
+    try {
+      const tokens = this.phpTokenizer.tokenize(content);
+      const lines = content.split('\n');
+
+      const sqlSinkLines = new Set();
+      const xssSinkLines = new Set();
+      const commandSinkLines = new Set();
+
+      tokens.forEach(token => {
+        if (token.type !== 'FUNCTION') return;
+
+        const fn = (token.value || '').toLowerCase();
+        if (['mysqli_query', 'mysql_query', 'query', 'execute', 'prepare', 'exec'].includes(fn)) {
+          sqlSinkLines.add(token.line);
+        }
+        if (['echo', 'print', 'printf', 'sprintf'].includes(fn)) {
+          xssSinkLines.add(token.line);
+        }
+        if (['eval', 'assert', 'system', 'shell_exec', 'passthru', 'exec'].includes(fn)) {
+          commandSinkLines.add(token.line);
+        }
+      });
+
+      const bracketBalance = {
+        paren: (content.match(/\(/g) || []).length - (content.match(/\)/g) || []).length,
+        square: (content.match(/\[/g) || []).length - (content.match(/\]/g) || []).length,
+        curly: (content.match(/\{/g) || []).length - (content.match(/\}/g) || []).length,
+      };
+
+      const structureHealthy = bracketBalance.paren === 0 && bracketBalance.square === 0 && bracketBalance.curly === 0;
+
+      return {
+        available: true,
+        tokenCount: tokens.length,
+        structureHealthy,
+        sqlSinkLines,
+        xssSinkLines,
+        commandSinkLines,
+        summary: {
+          tokenCount: tokens.length,
+          structureHealthy,
+          sqlSinks: sqlSinkLines.size,
+          xssSinks: xssSinkLines.size,
+          commandSinks: commandSinkLines.size,
+          totalLines: lines.length,
+        }
+      };
+    } catch (error) {
+      this.logger.debug(`PHP structural analysis failed: ${error.message}`);
+      return { available: false, structureHealthy: false, summary: { error: error.message } };
+    }
+  }
+
+  /**
+   * Attach structural evidence and confidence boost for matching sink lines
+   */
+  getStructuralEvidence(finding, structuralAnalysis, content) {
+    if (!structuralAnalysis || !structuralAnalysis.available) {
+      return { confirmed: false, confidenceBoost: 0, summary: null };
+    }
+
+    const line = finding.line || 0;
+    const type = (finding.type || '').toUpperCase();
+
+    let confirmed = false;
+    let sinkKind = null;
+
+    if (type.includes('SQLI') && structuralAnalysis.sqlSinkLines.has(line)) {
+      confirmed = true;
+      sinkKind = 'sql';
+    } else if (type.includes('XSS') && structuralAnalysis.xssSinkLines.has(line)) {
+      confirmed = true;
+      sinkKind = 'xss';
+    } else if ((type.includes('CODE_INJECTION') || type.includes('COMMAND')) && structuralAnalysis.commandSinkLines.has(line)) {
+      confirmed = true;
+      sinkKind = 'command';
+    }
+
+    const confidenceBoost = confirmed && structuralAnalysis.structureHealthy ? 0.02 : 0;
+
+    return {
+      confirmed,
+      confidenceBoost,
+      summary: {
+        confirmed,
+        sinkKind,
+        structureHealthy: structuralAnalysis.structureHealthy,
+      }
+    };
   }
 
   /**
@@ -479,6 +604,9 @@ class Scanner {
       // Cross-Site Scripting (XSS)
       'XSS_TAINTED_OUTPUT': { cwe: 'CWE-79', name: 'Cross-site Scripting' },
       'XSS_DOM_MANIPULATION': { cwe: 'CWE-79', name: 'Cross-site Scripting' },
+      'XSS_DOM_ASSIGNMENT': { cwe: 'CWE-79', name: 'Cross-site Scripting' },
+      'XSS_INNERHTML': { cwe: 'CWE-79', name: 'Cross-site Scripting' },
+      'XSS_SCRIPT_INJECTION': { cwe: 'CWE-79', name: 'Cross-site Scripting' },
       'XSS_REFLECTED': { cwe: 'CWE-79', name: 'Cross-site Scripting' },
       'XSS_STORED': { cwe: 'CWE-79', name: 'Cross-site Scripting' },
       
