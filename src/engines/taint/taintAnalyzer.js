@@ -72,6 +72,13 @@ class TaintAnalyzer {
         this.tainted.add(varName);
       }
     }
+
+    // Track template literals: const q = `SELECT ... ${userInput} ...`
+    if (node.init.type === 'TemplateLiteral') {
+      if (this.containsTainted(node.init)) {
+        this.tainted.add(varName);
+      }
+    }
   }
 
   /**
@@ -221,6 +228,16 @@ class TaintAnalyzer {
 
     if (node.type === 'MemberExpression') {
       return this.containsTainted(node.object) || this.containsTainted(node.property);
+    }
+
+    // Handle template literals: `SELECT * FROM users WHERE id=${userInput}`
+    if (node.type === 'TemplateLiteral') {
+      return node.expressions.some(expr => this.containsTainted(expr));
+    }
+
+    // Handle assignment expressions inside template expressions
+    if (node.type === 'AssignmentExpression') {
+      return this.containsTainted(node.right);
     }
 
     return false;

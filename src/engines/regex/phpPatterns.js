@@ -141,7 +141,99 @@ const PHP_XSS_PATTERNS = [
   }
 ];
 
+// COMMAND INJECTION PATTERNS (untuk roadmap minggu 1)
+const PHP_COMMAND_INJECTION_PATTERNS = [
+  // Pattern 1: system() with $_GET
+  {
+    type: 'CMD_INJECTION_SYSTEM_GET',
+    name: 'Command Injection via system() with $_GET',
+    severity: 'CRITICAL',
+    confidence: 0.95,
+    description: 'system() executed with unsanitized $_GET input',
+    regex: /system\s*\([^)]*(\$_GET)/,
+    example: 'system("ping " . $_GET["host"]);'
+  },
+  
+  // Pattern 2: system() with $_POST
+  {
+    type: 'CMD_INJECTION_SYSTEM_POST',
+    name: 'Command Injection via system() with $_POST',
+    severity: 'CRITICAL',
+    confidence: 0.95,
+    description: 'system() executed with unsanitized $_POST input',
+    regex: /system\s*\([^)]*(\$_POST)/,
+    example: 'system("cat " . $_POST["file"]);'
+  },
+  
+  // Pattern 3: exec() with $_GET
+  {
+    type: 'CMD_INJECTION_EXEC_GET',
+    name: 'Command Injection via exec() with $_GET',
+    severity: 'CRITICAL',
+    confidence: 0.95,
+    description: 'exec() executed with unsanitized $_GET input',
+    regex: /exec\s*\([^)]*(\$_GET)/,
+    example: 'exec("ls " . $_GET["dir"]);'
+  },
+  
+  // Pattern 4: exec() with $_POST
+  {
+    type: 'CMD_INJECTION_EXEC_POST',
+    name: 'Command Injection via exec() with $_POST',
+    severity: 'CRITICAL',
+    confidence: 0.95,
+    description: 'exec() executed with unsanitized $_POST input',
+    regex: /exec\s*\([^)]*(\$_POST)/,
+    example: 'exec("rm " . $_POST["filename"]);'
+  },
+  
+  // Pattern 5: shell_exec() with user input
+  {
+    type: 'CMD_INJECTION_SHELL_EXEC',
+    name: 'Command Injection via shell_exec()',
+    severity: 'CRITICAL',
+    confidence: 0.93,
+    description: 'shell_exec() with user input (backticks equivalent)',
+    regex: /shell_exec\s*\([^)]*(\$_GET|\$_POST|\$_REQUEST)/,
+    example: 'shell_exec("whoami " . $_GET["user"]);'
+  },
+  
+  // Pattern 6: passthru() with user input
+  {
+    type: 'CMD_INJECTION_PASSTHRU',
+    name: 'Command Injection via passthru()',
+    severity: 'CRITICAL',
+    confidence: 0.93,
+    description: 'passthru() executed with user input',
+    regex: /passthru\s*\([^)]*(\$_GET|\$_POST|\$_REQUEST)/,
+    example: 'passthru("cat " . $_REQUEST["file"]);'
+  },
+  
+  // Pattern 7: backtick operator with user input
+  {
+    type: 'CMD_INJECTION_BACKTICK',
+    name: 'Command Injection via Backtick Operator',
+    severity: 'CRITICAL',
+    confidence: 0.90,
+    description: 'Backtick operator with user input',
+    regex: /`[^`]*(\$_GET|\$_POST|\$_REQUEST|\$\w+)[^`]*`/,
+    example: '$output = `ping $_GET["host"]`;'
+  },
+  
+  // Pattern 8: popen() with user input
+  {
+    type: 'CMD_INJECTION_POPEN',
+    name: 'Command Injection via popen()',
+    severity: 'HIGH',
+    confidence: 0.88,
+    description: 'popen() with user input',
+    regex: /popen\s*\([^)]*(\$_GET|\$_POST|\$_REQUEST)/,
+    example: 'popen("ls " . $_GET["dir"], "r");'
+  }
+];
+
 module.exports = {
   PHP_SQL_PATTERNS,
-  PHP_XSS_PATTERNS
+  PHP_XSS_PATTERNS,
+  PHP_COMMAND_INJECTION_PATTERNS
 };

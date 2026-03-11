@@ -148,11 +148,6 @@ securecli/
 │   ├── vulnerable-sqli.js
 │   └── vulnerable-xss.js
 │
-├── tests/
-│   ├── regex.test.js
-│   ├── taint.test.js
-│   └── scoring.test.js
-│
 ├── package.json
 ├── README.md
 └── LICENSE

@@ -66,7 +66,7 @@ class Scanner {
           this.logger.warn(`AST parsing skipped for ${filePath}: ${astError.message}`);
         }
       } else if (language === 'php') {
-        // NEW: PHP files use multi-engine detection (Regex + Taint Analysis)
+        // PHP files use multi-engine detection (Regex + Taint Analysis)
         this.logger.info(`PHP file detected: ${filePath} (using multi-engine detection)`);
         return this.detectPHPWithMultiEngine(filePath, content);
       }
@@ -74,10 +74,14 @@ class Scanner {
       // LAYER 1: DETECTION
       const regexFindings = this.detectWithRegex(content, language);
       
-      // Taint analysis only for JavaScript
+      // Taint analysis only for JavaScript — uses AST parsed above via taintAnalyzer
       let taintFindings = [];
       if (language === 'javascript' || language === 'typescript') {
         taintFindings = this.detectWithTaint(content);
+
+        // AST-enhanced: cross-validate taint findings with ASTEngine's call graph
+        // to add structural evidence (which variable/function calls are involved)
+        taintFindings = this._enrichTaintWithAST(taintFindings);
       }
 
       findings.push(...regexFindings);
@@ -554,6 +558,39 @@ class Scanner {
         astNode: finding.astNode,
         sanitized: finding.sanitized,
       };
+    });
+  }
+
+  /**
+   * Enrich JavaScript taint findings with data from ASTEngine's parsed call graph.
+   * ASTEngine has already walked the AST and stored variables/callExpressions.
+   * This method adds ast_confirmed flag and connection variable when ASTEngine
+   * independently agrees a sink function was called at the same line.
+   */
+  _enrichTaintWithAST(taintFindings) {
+    return taintFindings.map(finding => {
+      // Look up the sink call in ASTEngine's call expression list
+      const matchingCall = this.astEngine.callExpressions.find(call =>
+        call.line === finding.line &&
+        call.callee &&
+        finding.sinkFunction &&
+        call.callee.includes(finding.sinkFunction)
+      );
+
+      if (matchingCall) {
+        // ASTEngine independently confirmed this call exists at this line
+        const connectionVar = this.astEngine.extractDBConnection(matchingCall) || finding.connectionVar;
+        return {
+          ...finding,
+          engine: 'taint+ast',
+          confidence: Math.min(0.98, (finding.confidence || 0.85) + 0.07),
+          ast_confirmed: true,
+          connectionVar,
+          reason: 'Confirmed by taint analysis + AST call graph',
+        };
+      }
+
+      return finding;
     });
   }
 

@@ -54,21 +54,22 @@ class PHPTaintAnalyzer {
   extractSources(code) {
     const lines = code.split('\n');
     
-    // Find assignment patterns like: $id = $_REQUEST[ 'id' ];
+    // Pattern A: assignment — $id = $_GET['id']
     const assignmentPatterns = [
       /\$([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*\$_(GET|POST|REQUEST|COOKIE|SERVER|FILES|SESSION|ENV)\s*[\[\{]/gi
     ];
+
+    // Pattern B: direct superglobal usage — track superglobals themselves as virtual tainted vars
+    // so that mysqli_query($conn, "... " . $_GET['id']) is also caught
+    const directSuperGlobalPattern = /\$_(GET|POST|REQUEST|COOKIE|SESSION|ENV|COOKIE|FILES)\s*[\[\{]/gi;
     
     lines.forEach((line, lineIndex) => {
+      // A) Variable assignment from superglobal
       for (const pattern of assignmentPatterns) {
         const matches = [...line.matchAll(pattern)];
-        
         matches.forEach(match => {
           const varName = match[1];
-          const superglobalName = match[2];
-          const superglobal = '$_' + superglobalName;
-          
-          // Only mark as source if we haven't seen it before
+          const superglobal = '$_' + match[2];
           if (!this.taintedVariables.has(varName)) {
             this.taintedVariables.set(varName, {
               type: 'SOURCE',
@@ -81,7 +82,96 @@ class PHPTaintAnalyzer {
           }
         });
       }
+
+      // B) Direct superglobal — register virtual variable _GET_direct, _POST_direct, etc.
+      // so checkSQLSinks / checkXSSSinks can detect them inline
+      const directMatches = [...line.matchAll(directSuperGlobalPattern)];
+      directMatches.forEach(match => {
+        const superglobal = '$_' + match[1];
+        const virtualName = '_' + match[1] + '_direct';
+        if (!this.taintedVariables.has(virtualName)) {
+          this.taintedVariables.set(virtualName, {
+            type: 'SOURCE',
+            sourceType: this.getSourceType(superglobal),
+            severity: 'HIGH',
+            line: lineIndex + 1,
+            context: 'inline_superglobal',
+            superglobal: superglobal,
+            isInlineDirect: true
+          });
+        }
+      });
+
+      // C) Check if the line itself uses a superglobal inline inside a SQL sink
+      this._checkInlineSuperglobalSink(line, lineIndex);
     });
+  }
+
+  /**
+   * STEP 1b: Detect inline superglobal directly used in a sink on same line
+   * e.g. mysqli_query($conn, "SELECT ... " . $_GET['id'])
+   */
+  _checkInlineSuperglobalSink(line, lineIndex) {
+    const inlineSQLPattern = /(mysqli_query|mysql_query|->query|->execute|->prepare|->exec)\s*\([^)]*(\$_(GET|POST|REQUEST|COOKIE))/i;
+    const inlineXSSPattern = /(echo|print|printf)\s+[^;]*(\$_(GET|POST|REQUEST|COOKIE))/i;
+    const inlineCMDPattern = /(system|exec|shell_exec|passthru|popen)\s*\([^)]*(\$_(GET|POST|REQUEST|COOKIE))/i;
+
+    const sqlMatch = inlineSQLPattern.exec(line);
+    if (sqlMatch) {
+      const superglobal = sqlMatch[2];
+      const sourceType = this.getSourceType(superglobal.replace(/\[.*/, ''));
+      this.findings.push({
+        type: 'SQLI_TAINTED_QUERY',
+        name: `SQL Injection: superglobal ${superglobal} used directly in SQL sink`,
+        severity: 'CRITICAL',
+        confidence: 0.93,
+        line: lineIndex + 1,
+        variable: superglobal,
+        sink: sqlMatch[1],
+        sourceType: sourceType,
+        chain: [superglobal, sqlMatch[1]],
+        description: `${superglobal} flows directly to SQL execution ${sqlMatch[1]} without parameterization`,
+        proof: { source: sourceType, sink: sqlMatch[1], propagation: [superglobal], vulnerability_confirmed: true }
+      });
+    }
+
+    const xssMatch = inlineXSSPattern.exec(line);
+    if (xssMatch) {
+      const superglobal = xssMatch[2];
+      const sourceType = this.getSourceType(superglobal.replace(/\[.*/, ''));
+      this.findings.push({
+        type: 'XSS_TAINTED_OUTPUT',
+        name: `XSS: superglobal ${superglobal} echoed directly without escaping`,
+        severity: 'HIGH',
+        confidence: 0.90,
+        line: lineIndex + 1,
+        variable: superglobal,
+        sink: xssMatch[1],
+        sourceType: sourceType,
+        chain: [superglobal, xssMatch[1]],
+        description: `${superglobal} output directly via ${xssMatch[1]} without htmlspecialchars`,
+        proof: { source: sourceType, sink: xssMatch[1], propagation: [superglobal], vulnerability_confirmed: true }
+      });
+    }
+
+    const cmdMatch = inlineCMDPattern.exec(line);
+    if (cmdMatch) {
+      const superglobal = cmdMatch[2];
+      const sourceType = this.getSourceType(superglobal.replace(/\[.*/, ''));
+      this.findings.push({
+        type: 'CODE_INJECTION_TAINTED',
+        name: `Command Injection: superglobal ${superglobal} passed directly to ${cmdMatch[1]}`,
+        severity: 'CRITICAL',
+        confidence: 0.93,
+        line: lineIndex + 1,
+        variable: superglobal,
+        sink: cmdMatch[1],
+        sourceType: sourceType,
+        chain: [superglobal, cmdMatch[1]],
+        description: `${superglobal} flows directly to command execution ${cmdMatch[1]} without sanitization`,
+        proof: { source: sourceType, sink: cmdMatch[1], propagation: [superglobal], vulnerability_confirmed: true }
+      });
+    }
   }
 
   /**

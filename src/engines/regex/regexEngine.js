@@ -5,7 +5,7 @@
 
 const { SQL_PATTERNS } = require('./sqlPatterns');
 const { XSS_PATTERNS } = require('./xssPatterns');
-const { PHP_SQL_PATTERNS, PHP_XSS_PATTERNS } = require('./phpPatterns');
+const { PHP_SQL_PATTERNS, PHP_XSS_PATTERNS, PHP_COMMAND_INJECTION_PATTERNS } = require('./phpPatterns');
 
 class RegexEngine {
   constructor() {
@@ -13,10 +13,12 @@ class RegexEngine {
       javascript: {
         sql: SQL_PATTERNS,
         xss: XSS_PATTERNS,
+        command: [],
       },
       php: {
         sql: PHP_SQL_PATTERNS,
         xss: PHP_XSS_PATTERNS,
+        command: PHP_COMMAND_INJECTION_PATTERNS,
       }
     };
   }
@@ -31,9 +33,14 @@ class RegexEngine {
     // Use language-specific patterns, fallback to JavaScript patterns
     const langPatterns = this.patterns[language] || this.patterns.javascript;
 
-    // Scan both SQL and XSS patterns
+    // Scan SQL, XSS, and Command Injection patterns
     findings.push(...this.scanPatterns(code, langPatterns.sql, language));
     findings.push(...this.scanPatterns(code, langPatterns.xss, language));
+    
+    // Scan command injection patterns if available
+    if (langPatterns.command && langPatterns.command.length > 0) {
+      findings.push(...this.scanPatterns(code, langPatterns.command, language));
+    }
 
     return findings;
   }
@@ -72,11 +79,15 @@ class RegexEngine {
   }
 
   /**
-   * Get pattern by type (searches all languages)
+   * Get pattern by type (searches all languages and categories)
    */
   getPattern(type) {
     for (const lang in this.patterns) {
-      const allPatterns = [...this.patterns[lang].sql, ...this.patterns[lang].xss];
+      const allPatterns = [
+        ...this.patterns[lang].sql,
+        ...this.patterns[lang].xss,
+        ...(this.patterns[lang].command || []),
+      ];
       const found = allPatterns.find(p => p.type === type);
       if (found) return found;
     }
