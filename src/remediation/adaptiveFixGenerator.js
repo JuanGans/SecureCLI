@@ -109,7 +109,7 @@ class AdaptiveFixGenerator {
    * Generate prepared statement fix (generic)
    */
   generatePreparedFix(context, originalCode) {
-    const variable = context.inputSource?.sources?.[0] || 'userInput';
+    const variable = this.getBestVariableName(context, 'userInput');
     const sink = context.outputSink?.primarySink?.method || 'query';
 
     return {
@@ -211,7 +211,7 @@ class AdaptiveFixGenerator {
    * Generate Node.js generic fix
    */
   generateNodeFix(context, originalCode) {
-    const variable = context.inputSource?.sources?.[0] || 'req.query.id';
+    const variable = this.getBestVariableName(context, 'userInput');
     const extractedVar = this.extractVariableName(variable);
 
     return {
@@ -466,8 +466,63 @@ Combine validation, parameterization, and encoding.`,
    * Extract variable name from source expression
    */
   extractVariableName(source) {
+    if (!source) return 'userInput';
+
+    // Normalize source labels to practical variable names
+    const sourceMap = {
+      query_string: 'userInput',
+      request_body: 'userInput',
+      url_parameters: 'userInput',
+      http_headers: 'userInput',
+      cookies: 'userInput',
+      dom: 'userInput',
+      web_storage: 'userInput',
+    };
+
+    if (sourceMap[source]) return sourceMap[source];
+
+    const reqDotMatch = source.match(/req\.(query|body|params|headers|cookies)\.(\w+)/);
+    if (reqDotMatch) return reqDotMatch[2];
+
+    const phpMatch = source.match(/\$_(GET|POST|REQUEST|COOKIE)\[['"](\w+)['"]\]/i);
+    if (phpMatch) return `$${phpMatch[2]}`;
+
     const match = source.match(/\.(\w+)$/);
     return match ? match[1] : source;
+  }
+
+  /**
+   * Pick the most concrete variable name from extracted context.
+   */
+  getBestVariableName(context, fallback = 'userInput') {
+    const fromVarName = context?.variableName;
+    if (fromVarName && typeof fromVarName === 'string' && !this.isLikelyIntermediateVar(fromVarName)) {
+      return fromVarName;
+    }
+
+    const dataFlowSource = context?.dataFlow?.sources?.[0]?.source;
+    if (dataFlowSource) {
+      const extracted = this.extractVariableName(dataFlowSource);
+      if (extracted && !this.isLikelyIntermediateVar(extracted)) return extracted;
+    }
+
+    const parameterName = context?.dataFlow?.sources?.[0]?.parameter;
+    if (parameterName && !this.isLikelyIntermediateVar(parameterName)) {
+      return parameterName;
+    }
+
+    const fromVariableInfo = context?.variableInfo?.find(v => v && v.name && v.name !== 'express' && v.name !== 'app')?.name;
+    if (fromVariableInfo) return fromVariableInfo;
+
+    const fromDataFlow = context?.dataFlow?.sources?.[0]?.source || context?.inputSource?.sources?.[0];
+    if (fromDataFlow) return this.extractVariableName(fromDataFlow);
+
+    return fallback;
+  }
+
+  isLikelyIntermediateVar(name = '') {
+    const normalized = String(name).replace(/^\$/, '').toLowerCase();
+    return ['query', 'sql', 'stmt', 'statement', 'result', 'output', 'html', 'payload'].includes(normalized);
   }
 
   /**

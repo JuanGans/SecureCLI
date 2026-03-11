@@ -62,9 +62,109 @@ class ContextExtractor {
 
       return context;
     } catch (error) {
-      console.error(`Context extraction error: ${error.message}`);
-      return null;
+      // Fallback for non-JS sources (e.g. PHP) or invalid JS snippets.
+      return this.extractContextFallback(code, lineNumber, vulnerabilityType, error.message);
     }
+  }
+
+  /**
+   * Fallback context extraction without AST parsing.
+   * Keeps remediation rule-based for mixed real-world codebases.
+   */
+  extractContextFallback(code, lineNumber, vulnerabilityType, parseError = null) {
+    const slice = this.getLineContext(code, lineNumber, 6);
+
+    return {
+      framework: this.detectFramework(code),
+      codeStructure: {
+        hasErrorHandling: /try\s*\{|catch\s*\(/.test(slice),
+        hasValidation: this.detectValidationPatterns(slice),
+        hasLoops: /\b(for|while|foreach)\b/.test(slice),
+        hasConditionals: /\bif\s*\(/.test(slice),
+        nestingLevel: 0,
+        complexity: 0,
+      },
+      dataFlow: this.analyzeDataFlowTextOnly(slice),
+      variableInfo: this.extractVariableInfoTextOnly(slice),
+      functionContext: {
+        name: null,
+        type: 'text_fallback',
+        parameters: [],
+        isProbablyHandler: false,
+      },
+      inputSource: this.identifyInputSource(code, lineNumber),
+      outputSink: this.identifyOutputSink(code, lineNumber),
+      dataTransformation: this.analyzeTransformation(code, lineNumber),
+      extractionMode: 'text-fallback',
+      parseError,
+      vulnerabilityType,
+    };
+  }
+
+  getLineContext(code, lineNumber, radius = 4) {
+    const lines = code.split('\n');
+    const idx = Math.max(0, (lineNumber || 1) - 1);
+    const start = Math.max(0, idx - radius);
+    const end = Math.min(lines.length, idx + radius + 1);
+    return lines.slice(start, end).join('\n');
+  }
+
+  analyzeDataFlowTextOnly(slice) {
+    const sources = [];
+
+    const reqMatch = slice.match(/req\.(query|body|params|headers|cookies)\.(\w+)/);
+    if (reqMatch) {
+      sources.push({
+        type: 'request_parameter',
+        source: `req.${reqMatch[1]}.${reqMatch[2]}`,
+        parameter: reqMatch[2],
+        sourceType: reqMatch[1],
+      });
+    }
+
+    const phpMatch = slice.match(/\$_(GET|POST|REQUEST|COOKIE)\s*\[\s*['"](\w+)['"]\s*\]/i);
+    if (phpMatch) {
+      sources.push({
+        type: 'php_superglobal',
+        source: `$_${phpMatch[1].toUpperCase()}['${phpMatch[2]}']`,
+        parameter: phpMatch[2],
+        sourceType: phpMatch[1].toLowerCase(),
+      });
+    }
+
+    const transformations = [];
+    if (/`.*\$\{.*\}.*`/.test(slice)) transformations.push('template_literal');
+    if (/\.\s*(htmlspecialchars|intval|strip_tags|mysqli_real_escape_string)\b|\b(htmlspecialchars|intval|strip_tags|mysqli_real_escape_string)\s*\(/i.test(slice)) {
+      transformations.push('sanitizer');
+    }
+
+    return {
+      sources,
+      transformations,
+      sink: null,
+      directFlow: /\+\s*\$?\w+|\$\{\w+\}/.test(slice),
+    };
+  }
+
+  extractVariableInfoTextOnly(slice) {
+    const variables = [];
+    const seen = new Set();
+    const variableRegex = /(const|let|var)\s+(\w+)\s*=|\$(\w+)\s*=/g;
+    let match;
+
+    while ((match = variableRegex.exec(slice)) !== null) {
+      const name = match[2] || `$${match[3]}`;
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      variables.push({
+        name,
+        type: 'unknown',
+        initializedAt: null,
+        isFromRequest: /req\.|\$_(GET|POST|REQUEST|COOKIE)/i.test(slice),
+      });
+    }
+
+    return variables;
   }
 
   /**
@@ -292,15 +392,19 @@ class ContextExtractor {
    */
   identifyInputSource(code, lineNumber) {
     const sources = [];
+    const slice = this.getLineContext(code, lineNumber, 6);
 
-    if (code.includes('req.query')) sources.push('query_string');
-    if (code.includes('req.body')) sources.push('request_body');
-    if (code.includes('req.params')) sources.push('url_parameters');
-    if (code.includes('req.headers')) sources.push('http_headers');
-    if (code.includes('req.cookies')) sources.push('cookies');
-    if (code.includes('location.')) sources.push('url_location');
-    if (code.includes('document.')) sources.push('dom');
-    if (code.includes('localStorage') || code.includes('sessionStorage')) {
+    if (slice.includes('req.query')) sources.push('query_string');
+    if (slice.includes('req.body')) sources.push('request_body');
+    if (slice.includes('req.params')) sources.push('url_parameters');
+    if (slice.includes('req.headers')) sources.push('http_headers');
+    if (slice.includes('req.cookies')) sources.push('cookies');
+    if (/\$_GET|\$_REQUEST/i.test(slice)) sources.push('query_string');
+    if (/\$_POST/i.test(slice)) sources.push('request_body');
+    if (/\$_COOKIE/i.test(slice)) sources.push('cookies');
+    if (slice.includes('location.')) sources.push('url_location');
+    if (slice.includes('document.')) sources.push('dom');
+    if (slice.includes('localStorage') || slice.includes('sessionStorage')) {
       sources.push('web_storage');
     }
 
@@ -336,18 +440,19 @@ class ContextExtractor {
    */
   identifyOutputSink(code, lineNumber) {
     const sinks = new Map();
+    const slice = this.getLineContext(code, lineNumber, 6);
 
     // SQL sinks
-    if (code.includes('query(') || code.includes('execute(')) {
+    if (slice.includes('query(') || slice.includes('execute(') || /mysqli_query|mysql_query|->query\(|->exec\(|->execute\(/i.test(slice)) {
       sinks.set('sql_query', {
         type: 'sql',
-        method: code.match(/(\w+)\(.*query|execute/)?.[1] || 'unknown',
-        isSafeMethod: code.includes('prepare') || code.includes('bind')
+        method: slice.match(/(query|execute|mysqli_query|mysql_query|prepare|exec)/i)?.[1] || 'unknown',
+        isSafeMethod: slice.includes('prepare') || slice.includes('bind')
       });
     }
 
     // DOM sinks
-    if (code.includes('innerHTML')) {
+    if (slice.includes('innerHTML')) {
       sinks.set('dom_innerHTML', {
         type: 'dom',
         method: 'innerHTML',
@@ -355,7 +460,7 @@ class ContextExtractor {
       });
     }
 
-    if (code.includes('textContent')) {
+    if (slice.includes('textContent')) {
       sinks.set('dom_textContent', {
         type: 'dom',
         method: 'textContent',
@@ -364,10 +469,10 @@ class ContextExtractor {
     }
 
     // HTTP response sinks
-    if (code.includes('res.send') || code.includes('res.write')) {
+    if (slice.includes('res.send') || slice.includes('res.write') || /\becho\b|\bprint\b/.test(slice)) {
       sinks.set('http_response', {
         type: 'http',
-        method: code.match(/(send|write|render|json)/)?.[1] || 'unknown',
+        method: slice.match(/(send|write|render|json|echo|print)/)?.[1] || 'unknown',
         isSafeMethod: false
       });
     }

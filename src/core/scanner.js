@@ -9,7 +9,6 @@ const RegexEngine = require('../engines/regex/regexEngine');
 const TaintAnalyzer = require('../engines/taint/taintAnalyzer');
 const ASTEngine = require('../engines/ast/astEngine');
 const ContextAnalyzer = require('../context/contextAnalyzer');
-const TemplateEngine = require('../remediation/templateEngine');
 const RiskScorer = require('../scoring/riskScorer');
 const Logger = require('../utils/logger');
 const { detectLanguage, isInDocumentation, isHardcoded } = require('../utils/helpers');
@@ -19,6 +18,7 @@ const CommentStripper = require('../utils/commentStripper');
 const DynamicPatternAnalyzer = require('../engines/patterns/dynamicPatternAnalyzer');
 const ContextExtractor = require('./contextExtractor');
 const AdaptiveFixGenerator = require('../remediation/adaptiveFixGenerator');
+const RuleBasedRecommendationEngine = require('../remediation/ruleBasedRecommendationEngine');
 
 // NEW: Multi-engine detection for improved accuracy
 const MultiEngineDetector = require('../engines/multiEngineDetector');
@@ -34,7 +34,6 @@ class Scanner {
     this.phpTokenizer = new PHPTokenizer();
     this.astEngine = new ASTEngine();
     this.contextAnalyzer = new ContextAnalyzer(this.astEngine);
-    this.templateEngine = new TemplateEngine();
     this.scorer = new RiskScorer();
     this.logger = new Logger(options.verbose);
     this.multiEngineDetector = new MultiEngineDetector();  // NEW: Multi-engine coordinator
@@ -43,6 +42,11 @@ class Scanner {
     this.patternAnalyzer = new DynamicPatternAnalyzer();
     this.contextExtractor = new ContextExtractor();
     this.fixGenerator = new AdaptiveFixGenerator();
+    this.ruleRecommendationEngine = new RuleBasedRecommendationEngine({
+      contextAnalyzer: this.contextAnalyzer,
+      contextExtractor: this.contextExtractor,
+      fixGenerator: this.fixGenerator,
+    });
   }
 
   /**
@@ -106,9 +110,10 @@ class Scanner {
 
       // LAYER 3: CONTEXT ANALYSIS & REMEDIATION
       const enhancedFindings = filteredFindings.map(finding => {
-        // Apply context analysis to taint findings
-        if (finding.engine === 'taint' && finding.apiContext) {
-          return this.enhanceFindingWithContext(finding);
+        // Apply rule-based contextual remediation to SQLI/XSS findings.
+        // Works for taint, taint+ast, and regex findings by normalizing vulnerability type.
+        if (this.shouldApplyContextualRemediation(finding)) {
+          return this.enhanceFindingWithContext(finding, content);
         }
         return finding;
       });
@@ -459,23 +464,34 @@ class Scanner {
   }
 
   /**
-   * Enhance finding with context analysis and remediation template
-   * PHASE 2 & 3 Integration (Legacy method for backward compatibility)
+   * Determine whether finding is eligible for contextual remediation.
    */
-  enhanceFindingWithContext(finding) {
-    try {
-      // Analyze context to determine fix strategy
-      const analyzedFinding = this.contextAnalyzer.analyze(finding);
+  shouldApplyContextualRemediation(finding) {
+    const vulnType = (finding.vulnerabilityType || '').toUpperCase();
+    const type = (finding.type || '').toUpperCase();
 
-      // Generate context-aware fix using template engine
-      const contextAwareFix = this.templateEngine.render(analyzedFinding);
+    return vulnType === 'SQLI' || vulnType === 'XSS' ||
+      type.includes('SQLI') || type.includes('XSS');
+  }
+
+  /**
+   * Enhance finding with full rule-based contextual recommendation.
+   */
+  enhanceFindingWithContext(finding, sourceCode = '') {
+    try {
+      const contextAwareFix = this.ruleRecommendationEngine.recommend(finding, sourceCode);
+
+      if (!contextAwareFix) {
+        return finding;
+      }
 
       return {
-        ...analyzedFinding,
-        contextAwareFix: contextAwareFix,
+        ...finding,
+        contextAwareFix,
+        adaptiveFix: contextAwareFix,
+        remediationMode: 'rule-based-contextual',
       };
     } catch (error) {
-      // If context analysis fails, return original finding
       return finding;
     }
   }
