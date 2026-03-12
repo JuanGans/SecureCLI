@@ -28,8 +28,14 @@ class PHPTaintAnalyzer {
       // Step 2: Track variable assignments and propagation
       this.trackAssignments(code);
       
+      // Step 2.5: Re-check sanitization sufficiency for context
+      this.validateSanitizationSufficiency(code);
+      
       // Step 3: Find sinks and validate complete chains
       this.findSinksWithChains(code);
+      
+      // Step 4: Deduplicate findings (prevent same sink reported twice)
+      this.deduplicateFindings();
       
       return this.findings;
     } catch (error) {
@@ -59,6 +65,10 @@ class PHPTaintAnalyzer {
       /\$([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*\$_(GET|POST|REQUEST|COOKIE|SERVER|FILES|SESSION|ENV)\s*[\[\{]/gi
     ];
 
+    // Pattern A2: function-wrapped superglobal assignment — $name = str_replace('x', '', $_GET['name'])
+    // Uses .* instead of [^)]* to handle regex patterns that contain ) inside string arguments
+    const wrappedAssignmentPattern = /\$([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*\w+\s*\(.*\$_(GET|POST|REQUEST|COOKIE|SESSION|ENV)\s*\[/gi;
+
     // Pattern B: direct superglobal usage — track superglobals themselves as virtual tainted vars
     // so that mysqli_query($conn, "... " . $_GET['id']) is also caught
     const directSuperGlobalPattern = /\$_(GET|POST|REQUEST|COOKIE|SESSION|ENV|COOKIE|FILES)\s*[\[\{]/gi;
@@ -82,6 +92,43 @@ class PHPTaintAnalyzer {
           }
         });
       }
+
+      // A2) Function-wrapped superglobal: $name = str_replace('', '', $_GET['name'])
+      // Track as tainted — BUT check if wrapping function is a proper sanitizer
+      const wrappedMatches = [...line.matchAll(wrappedAssignmentPattern)];
+      wrappedMatches.forEach(match => {
+        const varName = match[1];
+        const superglobal = '$_' + match[2];
+        if (!this.taintedVariables.has(varName)) {
+          // Extract the wrapping function name
+          const funcMatch = /=\s*(\w+)\s*\(/.exec(line);
+          const wrapperFunc = funcMatch ? funcMatch[1] : '';
+          
+          // Proper XSS sanitization functions — mark as SANITIZED
+          const properSanitizers = ['htmlspecialchars', 'htmlentities', 'intval', 'floatval', 'filter_var', 'filter_input'];
+          if (properSanitizers.includes(wrapperFunc)) {
+            this.taintedVariables.set(varName, {
+              type: 'SANITIZED',
+              sourceType: this.getSourceType(superglobal),
+              severity: 'LOW',
+              line: lineIndex + 1,
+              context: 'sanitized_with_' + wrapperFunc,
+              chain: [superglobal, varName],
+              sanitizedBy: wrapperFunc,
+              isSanitized: true
+            });
+          } else {
+            this.taintedVariables.set(varName, {
+              type: 'SOURCE',
+              sourceType: this.getSourceType(superglobal),
+              severity: 'HIGH',
+              line: lineIndex + 1,
+              context: 'wrapped_superglobal',
+              superglobal: superglobal
+            });
+          }
+        }
+      });
 
       // B) Direct superglobal — register virtual variable _GET_direct, _POST_direct, etc.
       // so checkSQLSinks / checkXSSSinks can detect them inline
@@ -114,6 +161,7 @@ class PHPTaintAnalyzer {
   _checkInlineSuperglobalSink(line, lineIndex) {
     const inlineSQLPattern = /(mysqli_query|mysql_query|->query|->execute|->prepare|->exec)\s*\([^)]*(\$_(GET|POST|REQUEST|COOKIE))/i;
     const inlineXSSPattern = /(echo|print|printf)\s+[^;]*(\$_(GET|POST|REQUEST|COOKIE))/i;
+    const inlineXSSConcatPattern = /\$\w+\s*\.=\s*[^;]*(\$_(GET|POST|REQUEST|COOKIE|SESSION))\s*\[/i;
     const inlineCMDPattern = /(system|exec|shell_exec|passthru|popen)\s*\([^)]*(\$_(GET|POST|REQUEST|COOKIE))/i;
 
     const sqlMatch = inlineSQLPattern.exec(line);
@@ -152,6 +200,29 @@ class PHPTaintAnalyzer {
         description: `${superglobal} output directly via ${xssMatch[1]} without htmlspecialchars`,
         proof: { source: sourceType, sink: xssMatch[1], propagation: [superglobal], vulnerability_confirmed: true }
       });
+    }
+
+    // Detect $html .= '...' . $_GET['name'] . '...' (concat with superglobal in .= context)
+    const xssConcatMatch = inlineXSSConcatPattern.exec(line);
+    if (xssConcatMatch && !xssMatch) {
+      const superglobal = xssConcatMatch[1];
+      const sourceType = this.getSourceType(superglobal.replace(/\[.*/, ''));
+      // Ensure no htmlspecialchars on the same line 
+      if (!/htmlspecialchars|htmlentities/.test(line)) {
+        this.findings.push({
+          type: 'XSS_TAINTED_OUTPUT',
+          name: `XSS: superglobal ${superglobal} concatenated into HTML output without escaping`,
+          severity: 'HIGH',
+          confidence: 0.90,
+          line: lineIndex + 1,
+          variable: superglobal,
+          sink: '.= (HTML concatenation)',
+          sourceType: sourceType,
+          chain: [superglobal, '.='],
+          description: `${superglobal} concatenated into HTML string without htmlspecialchars`,
+          proof: { source: sourceType, sink: '.=', propagation: [superglobal], vulnerability_confirmed: true }
+        });
+      }
     }
 
     const cmdMatch = inlineCMDPattern.exec(line);
@@ -219,16 +290,29 @@ class PHPTaintAnalyzer {
     // For each tainted variable, find where it's used in assignments
     for (const [varName, taintInfo] of this.taintedVariables.entries()) {
       lines.forEach((line, lineIndex) => {
-        // Check if variable is sanitized
+        // Check if variable is sanitized (direct pattern)
         const sanitizationPattern = new RegExp(
           `\\$([a-zA-Z_][a-zA-Z0-9_]*)\\s*=\\s*(${sanitizationFunctions.join('|')})\\s*\\([^)]*\\$${varName}[^)]*\\)`,
           'i'
         );
         const sanitizeMatch = sanitizationPattern.exec(line);
         
-        if (sanitizeMatch) {
-          const sanitizedVar = sanitizeMatch[1];
-          const sanitizeFunc = sanitizeMatch[2];
+        // Also check ternary pattern: $var = ((cond) ? sanitizeFunc(..., $var) : fallback)
+        // Common in DVWA: $msg = ((isset($GLOBALS[...])) ? mysqli_real_escape_string($GLOBALS[...], $msg) : ...)
+        let ternarySanitizeMatch = null;
+        if (!sanitizeMatch) {
+          const ternaryPattern = new RegExp(
+            `\\$([a-zA-Z_][a-zA-Z0-9_]*)\\s*=\\s*\\(?\\(?[^;]*(${sanitizationFunctions.join('|')})\\s*\\([^)]*\\$${varName}`,
+            'i'
+          );
+          ternarySanitizeMatch = ternaryPattern.exec(line);
+        }
+
+        const effectiveMatch = sanitizeMatch || ternarySanitizeMatch;
+        
+        if (effectiveMatch) {
+          const sanitizedVar = effectiveMatch[1];
+          const sanitizeFunc = effectiveMatch[2];
           
           // Mark as sanitized (don't track as tainted)
           this.taintedVariables.set(sanitizedVar, {
@@ -243,6 +327,29 @@ class PHPTaintAnalyzer {
           });
           
           return; // Skip normal propagation for sanitized variables
+        }
+        
+        // Check for str_replace targeting specific tags — this is NOT real sanitization
+        // str_replace('<script>', '', $var) is bypassable via <Script>, <img onerror=...>
+        const strReplacePattern = new RegExp(
+          `\\$([a-zA-Z_][a-zA-Z0-9_]*)\\s*=\\s*str_replace\\s*\\(\\s*['"]['"]?\\s*<\\s*script\\s*>['"]\\s*,\\s*['"]\\s*['"]\\s*,\\s*[^)]*\\$${varName}`,
+          'i'
+        );
+        const strReplaceMatch = strReplacePattern.exec(line);
+        if (strReplaceMatch) {
+          const assignedVar = strReplaceMatch[1];
+          // Mark as insufficiently sanitized — str_replace is bypassable
+          this.taintedVariables.set(assignedVar, {
+            type: 'INSUFFICIENTLY_SANITIZED',
+            sourceType: taintInfo.sourceType,
+            severity: 'HIGH',
+            line: lineIndex + 1,
+            context: 'bypassable_str_replace',
+            chain: [varName, assignedVar],
+            isSanitized: false,
+            insufficientReason: 'str_replace only removes exact <script> tag — bypassable via case variation or event handlers',
+          });
+          return;
         }
         
         // Find assignments involving this variable (normal propagation)
@@ -396,6 +503,9 @@ class PHPTaintAnalyzer {
         if (sinkVarName && this.isTaintedVariable(sinkVarName)) {
           const taintInfo = this.taintedVariables.get(sinkVarName);
           
+          // Skip if there's proper output encoding on this line
+          if (/htmlspecialchars|htmlentities/.test(line)) continue;
+          
           this.findings.push({
             type: 'XSS_TAINTED_OUTPUT',
             name: `XSS via tainted output`,
@@ -411,6 +521,36 @@ class PHPTaintAnalyzer {
               source: taintInfo.sourceType,
               sink: this.extractSinkFunc(line),
               propagation: this.buildChain(sinkVarName),
+              vulnerability_confirmed: true
+            }
+          });
+        }
+      }
+    }
+
+    // .= with string interpolation containing tainted variable: $html .= "...{$name}..."
+    const concatInterpolation = /\.\=\s*["'].*\{\$(\w+)\}/i;
+    const concatMatch = concatInterpolation.exec(line);
+    if (concatMatch) {
+      const varName = concatMatch[1];
+      if (this.isTaintedVariable(varName)) {
+        const taintInfo = this.taintedVariables.get(varName);
+        if (!/htmlspecialchars|htmlentities/.test(line)) {
+          this.findings.push({
+            type: 'XSS_TAINTED_OUTPUT',
+            name: `XSS via tainted variable in HTML string interpolation`,
+            severity: 'HIGH',
+            confidence: 0.88,
+            line: lineIndex + 1,
+            variable: varName,
+            sink: '.= (string interpolation)',
+            sourceType: taintInfo.sourceType,
+            chain: this.buildChain(varName),
+            description: `Tainted variable \`${varName}\` interpolated into HTML output without encoding`,
+            proof: {
+              source: taintInfo.sourceType,
+              sink: '.=',
+              propagation: this.buildChain(varName),
               vulnerability_confirmed: true
             }
           });
@@ -508,6 +648,137 @@ class PHPTaintAnalyzer {
    */
   getFindings() {
     return this.findings;
+  }
+
+  /**
+   * Step 2.5: Validate that sanitization is sufficient for the context
+   * e.g., mysqli_real_escape_string is NOT enough for unquoted numeric context
+   * e.g., str_replace('<script>') / preg_replace for script tags only is bypassable XSS
+   */
+  validateSanitizationSufficiency(code) {
+    const lines = code.split('\n');
+
+    for (const [varName, taintInfo] of this.taintedVariables.entries()) {
+      if (taintInfo.type !== 'SANITIZED') continue;
+
+      const sanitizeFunc = taintInfo.sanitizedBy;
+
+      // Check 1: mysqli_real_escape_string in unquoted SQL numeric context
+      if (sanitizeFunc === 'mysqli_real_escape_string' || sanitizeFunc === 'mysql_real_escape_string') {
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          const numericContextPattern = new RegExp(
+            `(WHERE|AND|OR|SET)\\s+\\w+\\s*=\\s*\\$${varName}(?!['"])`, 'i'
+          );
+          if (numericContextPattern.test(line)) {
+            this.taintedVariables.set(varName, {
+              ...taintInfo,
+              type: 'INSUFFICIENTLY_SANITIZED',
+              isSanitized: false,
+              severity: 'HIGH',
+              insufficientReason: `${sanitizeFunc} does not protect unquoted numeric context`,
+            });
+            break;
+          }
+        }
+      }
+
+      // Check 2: str_replace / preg_replace targeting only <script> tags — bypassable XSS
+      if (sanitizeFunc === 'preg_replace' || sanitizeFunc === 'strip_tags') {
+        // Check the original sanitization line for what's being replaced
+        const sanitizeLine = lines[taintInfo.line - 1] || '';
+        const onlyTargetsScript = /preg_replace\s*\(\s*['"].*script/i.test(sanitizeLine);
+        
+        if (onlyTargetsScript) {
+          // preg_replace that only targets <script> is insufficient — <img onerror=...> bypasses it
+          this.taintedVariables.set(varName, {
+            ...taintInfo,
+            type: 'INSUFFICIENTLY_SANITIZED',
+            isSanitized: false,
+            severity: 'HIGH',
+            insufficientReason: `${sanitizeFunc} only removes script tags, bypassable via event handlers (e.g. <img onerror=...>)`,
+          });
+        }
+      }
+
+      // Check 3: stripslashes / trim — these are NOT XSS sanitization
+      if (sanitizeFunc === 'stripslashes' || sanitizeFunc === 'trim') {
+        // Check if the variable is later used in HTML output context without further encoding
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          const outputPattern = new RegExp(`(echo|print|\\.=)\\s*[^;]*\\$${varName}`, 'i');
+          if (outputPattern.test(line) && !/htmlspecialchars|htmlentities/.test(line)) {
+            this.taintedVariables.set(varName, {
+              ...taintInfo,
+              type: 'INSUFFICIENTLY_SANITIZED',
+              isSanitized: false,
+              severity: 'HIGH',
+              insufficientReason: `${sanitizeFunc} does not prevent XSS — output requires htmlspecialchars`,
+            });
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Step 4: Deduplicate findings
+   * Removes duplicate findings for the same vulnerability (same sink call)
+   */
+  deduplicateFindings() {
+    const unique = [];
+
+    for (const finding of this.findings) {
+      const duplicateIdx = unique.findIndex(existing =>
+        this._isSameFinding(existing, finding)
+      );
+
+      if (duplicateIdx === -1) {
+        unique.push(finding);
+      } else if (finding.confidence > unique[duplicateIdx].confidence) {
+        // Keep higher confidence, merge
+        unique[duplicateIdx] = { ...finding, engines: this._mergeEngines(unique[duplicateIdx], finding) };
+      }
+    }
+
+    this.findings = unique;
+  }
+
+  /**
+   * Check if two findings refer to the same vulnerability
+   */
+  _isSameFinding(a, b) {
+    // Same type category
+    const categoryA = (a.type || '').split('_')[0];
+    const categoryB = (b.type || '').split('_')[0];
+    if (categoryA !== categoryB) return false;
+
+    // Same line and same type
+    if (a.line === b.line && a.type === b.type) return true;
+
+    // Same sink on nearby lines
+    if (a.sink && b.sink && a.sink === b.sink) {
+      if (Math.abs((a.line || 0) - (b.line || 0)) <= 5) return true;
+    }
+
+    // Same proof sink
+    if (a.proof && b.proof && a.proof.sink === b.proof.sink) {
+      if (Math.abs((a.line || 0) - (b.line || 0)) <= 5) return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Merge engine arrays from two findings
+   */
+  _mergeEngines(a, b) {
+    const engines = new Set([
+      ...(a.engines || [a.engine || 'TAINT_ANALYSIS']),
+      ...(b.engines || [b.engine || 'TAINT_ANALYSIS'])
+    ]);
+    return Array.from(engines).filter(Boolean);
   }
 
   /**

@@ -71,6 +71,11 @@ function isHardcoded(code, lineNumber) {
   const line = lines[lineNumber - 1];
   
   if (!line) return false;
+
+  // Never filter lines containing known danger sinks
+  if (/document\.write|\.innerHTML|eval\s*\(|echo\s+|print\s+|mysqli_query|system\s*\(/.test(line)) {
+    return false;
+  }
   
   // Check for hardcoded patterns
   const hardcodedPatterns = [
@@ -79,7 +84,6 @@ function isHardcoded(code, lineNumber) {
     /window\.close/i,
     /self\.close/i,
     /<input[^>]+type=["'](text|submit|button)["'][^>]*>/i,  // Normal form inputs
-    /value=["'][^"']*["']/  // Inputs with hardcoded values
   ];
   
   return hardcodedPatterns.some(pattern => pattern.test(line));

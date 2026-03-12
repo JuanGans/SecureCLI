@@ -24,6 +24,14 @@ const RuleBasedRecommendationEngine = require('../remediation/ruleBasedRecommend
 const MultiEngineDetector = require('../engines/multiEngineDetector');
 const PHPTaintAnalyzer = require('../engines/taint/phpTaintAnalyzer');
 const PHPTokenizer = require('../engines/ast/phpTokenizer');
+const SQLiConsolidator = require('../engines/sqli/consolidate');
+
+// XSS Detection Engines
+const ReflectedXSSDetector = require('../engines/xss/reflected');
+const StoredXSSDetector = require('../engines/xss/stored');
+const DOMBasedXSSDetector = require('../engines/xss/dom-based');
+const EventXSSDetector = require('../engines/xss/event');
+const XSSConsolidator = require('../engines/xss/consolidate');
 
 class Scanner {
   constructor(options = {}) {
@@ -37,6 +45,12 @@ class Scanner {
     this.scorer = new RiskScorer();
     this.logger = new Logger(options.verbose);
     this.multiEngineDetector = new MultiEngineDetector();  // NEW: Multi-engine coordinator
+    
+    // XSS Detection Engines
+    this.reflectedXSSDetector = new ReflectedXSSDetector();
+    this.storedXSSDetector = new StoredXSSDetector();
+    this.domBasedXSSDetector = new DOMBasedXSSDetector();
+    this.eventXSSDetector = new EventXSSDetector();
     
     // ENHANCED: Initialize dynamic modules
     this.patternAnalyzer = new DynamicPatternAnalyzer();
@@ -157,13 +171,17 @@ class Scanner {
       this.logger.debug(`Running regex detection on ${filePath}`);
       const regexFindings = this.detectWithRegex(cleanedContent, 'php');
 
+      // Step 2.5: Run dedicated XSS engines
+      this.logger.debug(`Running XSS engines on ${filePath}`);
+      const xssFindings = this.detectWithXSSEngines(cleanedContent, filePath);
+
       // Step 3: Consolidate findings using multi-engine logic
-      this.logger.debug(`Consolidating findings from ${taintFindings.length} taint and ${regexFindings.length} regex detections`);
+      this.logger.debug(`Consolidating findings from ${taintFindings.length} taint, ${regexFindings.length} regex, and ${xssFindings.length} XSS detections`);
       const consolidatedFindings = this.consolidateDetections(
         filePath, 
         cleanedContent, 
         taintFindings, 
-        regexFindings,
+        [...regexFindings, ...xssFindings],
         structuralAnalysis
       );
 
@@ -257,6 +275,14 @@ class Scanner {
         // Only regex detected - include with lower confidence
         // But filter out obvious false positives
         if (!this.isLikelyFalsePositive(regexFinding, content)) {
+          // Drop XSS reflected/event findings that require taint confirmation but got none
+          // (stored XSS storage findings are kept even without taint confirmation)
+          if (regexFinding.requiresTaintConfirmation &&
+              (regexFinding.type === 'XSS_REFLECTED' || regexFinding.type === 'XSS_EVENT_HANDLER')) {
+            this.logger.debug(`Filtered: ${regexFinding.type} at line ${regexFinding.line} - requires taint confirmation`);
+            continue;
+          }
+
           const structuralEvidence = this.getStructuralEvidence(regexFinding, structuralAnalysis, content);
           const engines = ['REGEX'];
 
@@ -291,9 +317,13 @@ class Scanner {
       return aSeverity !== bSeverity ? aSeverity - bSeverity : (a.line || 0) - (b.line || 0);
     });
 
-    this.logger.info(`Consolidated: ${consolidated.length} findings (${consolidated.filter(f => f.isProvenVulnerability).length} proven, ${consolidated.filter(f => !f.isProvenVulnerability).length} unconfirmed)`);
+    // Final deduplication pass using SQLi and XSS consolidators
+    let deduplicated = SQLiConsolidator.consolidate(consolidated);
+    deduplicated = XSSConsolidator.consolidate(deduplicated);
 
-    return consolidated;
+    this.logger.info(`Consolidated: ${deduplicated.length} findings (${deduplicated.filter(f => f.isProvenVulnerability).length} proven, ${deduplicated.filter(f => !f.isProvenVulnerability).length} unconfirmed)`);
+
+    return deduplicated;
   }
 
   /**
@@ -311,12 +341,27 @@ class Scanner {
       return true;
     }
 
-    // Nearby lines and related types
-    if (Math.abs((regexFinding.line || 0) - (taintFinding.line || 0)) <= 3) {
-      if ((regexFinding.type === 'XSS_CONCAT' && taintFinding.type === 'XSS_TAINTED_OUTPUT') ||
-          (regexFinding.type === 'SQLI_VAR_INTERPOLATION' && taintFinding.type === 'SQLI_TAINTED_QUERY')) {
-        return true;
-      }
+    // Same type category on nearby lines
+    const regexCategory = (regexFinding.type || '').split('_')[0];
+    const taintCategory = (taintFinding.type || '').split('_')[0];
+    if (regexCategory === taintCategory && Math.abs((regexFinding.line || 0) - (taintFinding.line || 0)) <= 5) {
+      return true;
+    }
+
+    // Cross-type matches: SQLI regex types vs SQLI taint types
+    const sqliRegexTypes = ['SQLI_DIRECT_VAR', 'SQLI_CONCAT', 'SQLI_MYSQLI_QUERY', 'SQLI_MYSQL_QUERY', 'SQLI_PDO_QUERY', 'SQLI_VAR_INTERPOLATION'];
+    const sqliTaintTypes = ['SQLI_TAINTED_QUERY'];
+    if (sqliRegexTypes.includes(regexFinding.type) && sqliTaintTypes.includes(taintFinding.type)) {
+      if (Math.abs((regexFinding.line || 0) - (taintFinding.line || 0)) <= 5) return true;
+    }
+
+    // Cross-type matches: XSS regex types vs XSS taint types
+    const xssRegexTypes = ['XSS_ECHO', 'XSS_PRINT', 'XSS_CONCAT', 'XSS_HTML_VAR', 'XSS_SHORT_ECHO', 'XSS_ECHO_VAR'];
+    const xssEngineTypes = ['XSS_REFLECTED', 'XSS_STORED', 'XSS_STORED_INPUT', 'XSS_STORED_OUTPUT', 'XSS_DOM_BASED', 'XSS_EVENT_HANDLER'];
+    const xssTaintTypes = ['XSS_TAINTED_OUTPUT'];
+    const allXssTypes = [...xssRegexTypes, ...xssEngineTypes];
+    if (allXssTypes.includes(regexFinding.type) && xssTaintTypes.includes(taintFinding.type)) {
+      if (Math.abs((regexFinding.line || 0) - (taintFinding.line || 0)) <= 3) return true;
     }
 
     return false;
@@ -543,6 +588,34 @@ class Scanner {
   }
 
   /**
+   * Detect XSS using dedicated XSS engines
+   * Runs all 4 XSS type detectors and consolidates results
+   */
+  detectWithXSSEngines(content, filePath) {
+    const allXSSFindings = [];
+
+    try {
+      // Run all 4 XSS engines
+      const reflected = this.reflectedXSSDetector.detect(content, filePath);
+      const stored = this.storedXSSDetector.detect(content, filePath);
+      const domBased = this.domBasedXSSDetector.detect(content, filePath);
+      const event = this.eventXSSDetector.detect(content, filePath);
+
+      allXSSFindings.push(...reflected, ...stored, ...domBased, ...event);
+
+      // Consolidate XSS findings (remove duplicates across engines)
+      const consolidated = XSSConsolidator.consolidate(allXSSFindings);
+
+      this.logger.debug(`XSS engines: ${reflected.length} reflected, ${stored.length} stored, ${domBased.length} DOM, ${event.length} event → ${consolidated.length} unique`);
+
+      return consolidated;
+    } catch (error) {
+      this.logger.debug(`XSS engine detection error: ${error.message}`);
+      return allXSSFindings;
+    }
+  }
+
+  /**
    * Detect vulnerabilities using taint analysis
    * ENHANCED: Use vulnerability type from taint analyzer
    */
@@ -660,8 +733,12 @@ class Scanner {
       'XSS_DOM_ASSIGNMENT': { cwe: 'CWE-79', name: 'Cross-site Scripting' },
       'XSS_INNERHTML': { cwe: 'CWE-79', name: 'Cross-site Scripting' },
       'XSS_SCRIPT_INJECTION': { cwe: 'CWE-79', name: 'Cross-site Scripting' },
-      'XSS_REFLECTED': { cwe: 'CWE-79', name: 'Cross-site Scripting' },
-      'XSS_STORED': { cwe: 'CWE-79', name: 'Cross-site Scripting' },
+      'XSS_REFLECTED': { cwe: 'CWE-79', name: 'Cross-site Scripting (Reflected)' },
+      'XSS_STORED': { cwe: 'CWE-79', name: 'Cross-site Scripting (Stored)' },
+      'XSS_STORED_INPUT': { cwe: 'CWE-79', name: 'Cross-site Scripting (Stored - Input)' },
+      'XSS_STORED_OUTPUT': { cwe: 'CWE-79', name: 'Cross-site Scripting (Stored - Output)' },
+      'XSS_DOM_BASED': { cwe: 'CWE-79', name: 'Cross-site Scripting (DOM-Based)' },
+      'XSS_EVENT_HANDLER': { cwe: 'CWE-79', name: 'Cross-site Scripting (Event Handler)' },
       
       // Code Injection
       'CODE_INJECTION_TAINTED': { cwe: 'CWE-94', name: 'Code Injection' },
