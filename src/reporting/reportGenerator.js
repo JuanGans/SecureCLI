@@ -40,7 +40,7 @@ class ReportGenerator {
     ].join('\n') + '\n';
   }
 
-  formatFixSnippet(education, language = 'javascript') {
+  formatFixSnippet(education, language = 'javascript', finding = null, sourceCode = '') {
     if (!education?.fixSnippet) {
       return '';
     }
@@ -52,23 +52,66 @@ class ReportGenerator {
     // If scanning PHP, generate PHP-specific snippet
     if (language === 'php') {
       codeLanguage = 'php';
-      snippet = this.getPHPFixSnippet(education);
+      snippet = this.getPHPFixSnippet(education, finding, sourceCode);
     }
 
     return `🛠️  Snippet Perbaikan:\n\n\`\`\`${codeLanguage}\n${snippet}\n\`\`\`\n\n`;
   }
 
   /**
-   * Get PHP-specific fix snippets
+   * Get context-aware fix snippets (PHP, JavaScript, multi-context)
    */
-  getPHPFixSnippet(education) {
-    // Map education types to PHP fixes
-    if (education.title?.includes('SQL')) {
-      return `// ❌ Jangan gabung string query langsung dari input user\n// $query = "UPDATE users SET role='$newRole' WHERE id=$userId";\n\n// ✅ Gunakan prepared statement dengan mysqli\n$stmt = $conn->prepare("UPDATE users SET role = ? WHERE id = ?");\n$stmt->bind_param("si", $newRole, $userId);\n$stmt->execute();\n$stmt->close();\n\n// ATAU gunakan PDO dengan named parameters\n$stmt = $pdo->prepare("UPDATE users SET role = :role WHERE id = :id");\n$stmt->execute(['role' => $newRole, 'id' => $userId]);`;
+  getPHPFixSnippet(education, finding, sourceCode = '') {
+    // Try to extract the actual vulnerable code line from source
+    let actualCode = finding?.code || '';
+    if (sourceCode && finding?.line) {
+      const lines = sourceCode.split('\n');
+      if (lines[finding.line - 1]) {
+        actualCode = (lines[finding.line - 1] + ' ' + (lines[finding.line - 2] || '')).toLowerCase();
+      }
     }
     
+    const codeContent = actualCode.toLowerCase();
+    
+    // === SQLI FIXES ===
+    if (education.title?.includes('SQL') || education.title?.includes('Injection')) {
+      // Detect which database engine from the actual code line
+      if (codeContent.includes('mysqli_query') || 
+          codeContent.includes('mysqli_real_escape') ||
+          codeContent.includes('mysqli_execute') ||
+          codeContent.includes('__mysqli_ston')) {
+        // mysqli procedural API
+        return `// ❌ Jangan gabung string query langsung dari input user\n// $query = "SELECT * FROM users WHERE id = '$id'";\n// $result = mysqli_query($conn, $query);\n\n// ✅ Gunakan MySQLi Prepared Statement\n$stmt = $conn->prepare("SELECT * FROM users WHERE id = ?");\n$stmt->bind_param("i", $id);\n$stmt->execute();\n$result = $stmt->get_result();\n$stmt->close();`;
+      } else if (codeContent.includes('sqlite_db_connection') || 
+                 codeContent.includes('$sqlite')) {
+        // SQLite context
+        return `// ❌ Jangan gabung string query langsung dari input user\n// $query = "SELECT * FROM users WHERE id = '$id'";\n// $results = $sqlite_db_connection->query($query);\n\n// ✅ Gunakan SQLite Prepared Statement\n$stmt = $sqlite_db_connection->prepare("SELECT * FROM users WHERE id = ?");\n$result = $stmt->execute(array($id));`;
+      } else if (codeContent.includes('->prepare') || 
+                 codeContent.includes('$pdo')) {
+        // PDO/OOP context
+        return `// ❌ Jangan gabung string query langsung dari input user\n// $query = "SELECT * FROM users WHERE id = '$id'";\n\n// ✅ Gunakan PDO dengan Prepared Statement (RECOMMENDED)\n$stmt = $pdo->prepare("SELECT * FROM users WHERE id = ?");\n$stmt->execute([$id]);\n\n// ATAU gunakan named parameters:\n$stmt = $pdo->prepare("SELECT * FROM users WHERE id = :id");\n$stmt->execute(['id' => $id]);`;
+      } else {
+        // Default/generic fallback
+        return `// ❌ Jangan gabung string query langsung dari input user\n// $query = "UPDATE users SET role='$newRole' WHERE id=$userId";\n\n// ✅ Gunakan Prepared Statement (RECOMMENDED)\n// Untuk MySQLi:\n$stmt = $conn->prepare("UPDATE users SET role = ? WHERE id = ?");\n$stmt->bind_param("si", $newRole, $userId);\n$stmt->execute();\n\n// Untuk PDO:\n$stmt = $pdo->prepare("UPDATE users SET role = :role WHERE id = :id");\n$stmt->execute(['role' => $newRole, 'id' => $userId]);`;
+      }
+    }
+    
+    // === XSS FIXES ===
     if (education.title?.includes('XSS') || education.title?.includes('Cross-Site')) {
-      return `// ❌ Jangan echo input user langsung\n// echo "<h1>Hello " . $_GET['name'] . "</h1>";\n\n// ✅ Escape output dengan htmlspecialchars\n$safeName = htmlspecialchars($_GET['name'], ENT_QUOTES, 'UTF-8');\necho "<h1>Hello " . $safeName . "</h1>";\n\n// ATAU gunakan framework escaping (Laravel, Symfony, dll)\n// Blade: {{ $name }} - auto-escaped\n// Twig: {{ name }} - auto-escaped`;
+      // Check if this is JavaScript context (DOM-based XSS)
+      if (codeContent.includes('document.write') || 
+          codeContent.includes('.innerhtml') || 
+          finding?.type?.includes('DOM') ||
+          codeContent.includes('innertext') ||
+          codeContent.includes('document.location') ||
+          codeContent.includes('eval(') ||
+          codeContent.includes('.appendchild')) {
+        // JavaScript context - provide JavaScript escaping
+        return `// ❌ Jangan gunakan user input langsung di DOM\n// document.write("<h1>" + userName + "</h1>");\n// element.innerHTML = userInput;\n\n// ✅ Escape output untuk JavaScript\nfunction encodeHTML(text) {\n  const map = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'};\n  return String(text).replace(/[&<>"']/g, m => map[m]);\n}\n\n// Safer: Gunakan textContent untuk plain text\nelement.textContent = userInput;  // Auto-escaped\n\n// Atau encode jika perlu HTML:\nconst encoded = encodeHTML(userInput);\ndocument.write("<h1>" + encoded + "</h1>");`;
+      } else {
+        // PHP context - provide PHP escaping
+        return `// ❌ Jangan echo input user langsung\n// echo "<h1>Hello " . $_GET['name'] . "</h1>";\n\n// ✅ Escape output dengan htmlspecialchars (RECOMMENDED)\n$safeName = htmlspecialchars($_GET['name'], ENT_QUOTES, 'UTF-8');\necho "<h1>Hello " . $safeName . "</h1>";\n\n// ATAU gunakan framework escaping\n// Blade (Laravel): {{ $name }} - auto-escaped\n// Twig (Symfony): {{ name }} - auto-escaped`;
+      }
     }
     
     // Default generic PHP fix
@@ -164,7 +207,7 @@ class ReportGenerator {
     if (finding.contextAwareFix) {
       report += this.formatContextAwareFix(finding.contextAwareFix);
     } else {
-      report += this.formatFixSnippet(education, language);
+      report += this.formatFixSnippet(education, language, finding, sourceCode);
     }
 
     return report;
