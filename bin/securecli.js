@@ -14,9 +14,35 @@
 
 const path = require('path');
 const Orchestrator = require('../src/core/orchestrator');
+const { startApiServer } = require('../src/server/apiServer');
 const { parseArgs } = require('../src/utils/helpers');
 const { log } = require('../src/utils/colors');
 const config = require('../src/config/config');
+
+function parseServerArgs(argv) {
+  const serverOptions = {
+    enabled: false,
+    port: process.env.PORT || 3001,
+    host: process.env.HOST || '0.0.0.0',
+    corsOrigin: process.env.CORS_ORIGIN || '*',
+  };
+
+  for (let i = 2; i < argv.length; i++) {
+    const arg = argv[i];
+
+    if (arg === 'serve' || arg === '--server') {
+      serverOptions.enabled = true;
+    } else if (arg === '--port') {
+      serverOptions.port = argv[++i] || serverOptions.port;
+    } else if (arg === '--host') {
+      serverOptions.host = argv[++i] || serverOptions.host;
+    } else if (arg === '--cors-origin') {
+      serverOptions.corsOrigin = argv[++i] || serverOptions.corsOrigin;
+    }
+  }
+
+  return serverOptions;
+}
 
 /**
  * Display help information
@@ -37,6 +63,10 @@ function displayHelp() {
     -v, --verbose         Enable verbose output with full explanations
     -o, --output <path>   Save reports to specified directory
     --format <fmt>        Output format: cli, json (default: cli)
+    serve, --server       Start HTTP API server mode
+    --port <number>       API server port (default: 3001)
+    --host <host>         API server host (default: 0.0.0.0)
+    --cors-origin <url>   CORS origin (default: *)
     -h, --help            Display this help message
     --version             Display version information
 
@@ -44,6 +74,7 @@ function displayHelp() {
     securecli /path/to/app
     securecli app.js --verbose -o ./reports
     securecli /path/to/code --format json
+    securecli serve --port 3001 --cors-origin http://localhost:3000
 
   Layers of Analysis:
     Layer 1: Detection    → Regex, Taint Analysis, AST Parsing
@@ -66,6 +97,8 @@ function displayVersion() {
  * Main execution
  */
 async function main() {
+  const serverOptions = parseServerArgs(process.argv);
+
   const args = parseArgs(process.argv);
 
   // Handle help
@@ -78,6 +111,12 @@ async function main() {
   if (process.argv.includes('--version')) {
     displayVersion();
     process.exit(0);
+  }
+
+  // Handle API server mode
+  if (serverOptions.enabled) {
+    startApiServer(serverOptions);
+    return;
   }
 
   // Validate target

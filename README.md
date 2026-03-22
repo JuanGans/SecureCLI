@@ -76,6 +76,62 @@ securecli app.js --format json
 
 # Save reports to directory
 securecli app.js -o ./security-reports
+
+# Start API server mode for web integration
+securecli serve --port 3001 --cors-origin http://localhost:3000
+```
+
+## 🌐 API Server Mode (for Next.js)
+
+SecureCLI dapat dijalankan sebagai HTTP API server agar bisa dipanggil dari aplikasi Next.js.
+
+```bash
+# Run via npm script
+npm run start:api
+
+# Or run directly
+securecli serve --port 3001 --cors-origin http://localhost:3000
+```
+
+### Endpoints
+
+- `GET /health` - health check server
+- `GET /docs` - ringkasan endpoint API
+- `POST /scan` - jalankan scan untuk file/folder target
+
+### Request Body `POST /scan`
+
+```json
+{
+  "target": "./src",
+  "verbose": true,
+  "output": "./reports"
+}
+```
+
+### Example Next.js Route Handler
+
+```javascript
+// app/api/secure-scan/route.js
+import { NextResponse } from 'next/server';
+
+export async function POST(request) {
+  const body = await request.json();
+
+  const response = await fetch('http://localhost:3001/scan', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      target: body.target,
+      verbose: true,
+    }),
+  });
+
+  const result = await response.json();
+  return NextResponse.json(result, { status: response.status });
+}
 ```
 
 ## 📋 Usage
@@ -90,6 +146,10 @@ Options:
   -v, --verbose         Enable verbose output with full explanations
   -o, --output <path>   Save reports to specified directory
   --format <fmt>        Output format: cli, json (default: cli)
+  serve, --server       Start HTTP API server mode
+  --port <number>       API server port (default: 3001)
+  --host <host>         API server host (default: 0.0.0.0)
+  --cors-origin <url>   CORS origin (default: *)
   -h, --help            Display this help message
   --version             Display version information
 
@@ -97,6 +157,7 @@ Examples:
   securecli /path/to/app
   securecli app.js --verbose -o ./reports
   securecli /path/to/code --format json
+  securecli serve --port 3001 --cors-origin http://localhost:3000
 ```
 
 ## 🏗️ Project Structure

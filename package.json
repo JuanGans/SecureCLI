@@ -8,6 +8,7 @@
   },
   "scripts": {
     "start": "node bin/securecli.js",
+    "start:api": "node bin/securecli.js serve --port 3001",
     "test": "node -e \"console.log('Use SecureCLI directly against target files for manual validation.')\"",
     "lint": "eslint src/**/*.js",
     "scan:examples": "node bin/securecli.js --verbose examples"

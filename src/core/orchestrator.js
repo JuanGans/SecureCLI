@@ -26,6 +26,9 @@ class Orchestrator {
     this.logger.info(`Starting SecureCLI scan on ${target}`);
 
     try {
+      // Reset findings so the same orchestrator instance can be reused safely.
+      this.allFindings = [];
+
       // Load files
       const files = FileLoader.loadFiles(target);
       this.logger.success(`Found ${files.length} files to scan`);
