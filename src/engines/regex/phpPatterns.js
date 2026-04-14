@@ -5,13 +5,15 @@
 
 const PHP_SQL_PATTERNS = [
   // Pattern 1: Direct variable in query (most common PHP SQLi)
+  // ENHANCED: More specific - must have SQL context
   {
     type: 'SQLI_DIRECT_VAR',
     name: 'Direct Variable in SQL Query',
     severity: 'CRITICAL',
     confidence: 0.85,
     description: 'Variable directly embedded in SQL query without escaping',
-    regex: /(\$_GET|\$_POST|\$_REQUEST|\$_COOKIE|\$\w+)\s*\.\s*["']/,
+    // Only match if there's SQL keyword context nearby
+    regex: /(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|JOIN|UNION|ORDER\s+BY).+(\$_GET|\$_POST|\$_REQUEST|\$_COOKIE|\$\w+)\s*\.\s*["']/i,
     example: '$query = "SELECT * FROM users WHERE id=" . $_GET["id"];'
   },
   
@@ -94,15 +96,16 @@ const PHP_XSS_PATTERNS = [
     example: 'print $_POST["comment"];'
   },
   
-  // Pattern 3: Variable directly in HTML context
+  // Pattern 3: Variable directly in HTML context (ONLY user input variables)
   {
     type: 'XSS_HTML_VAR',
-    name: 'Variable in HTML Without Escaping',
+    name: 'User Input in HTML Without Escaping',
     severity: 'HIGH',
     confidence: 0.80,
-    description: 'PHP variable embedded in HTML without escaping',
-    regex: /<[^>]*\{?\s*\$(\w+|\$_GET|\$_POST|\$_REQUEST|\$_COOKIE)\s*\}?[^>]*>/,
-    example: '<div><?php echo $_GET["content"]; ?></div>'
+    description: 'User input variable embedded in HTML without escaping',
+    // Only match actual user input superglobals, not arbitrary variables
+    regex: /<[^>]*\{?\s*(\$_GET\[|\$_POST\[|\$_REQUEST\[|\$_COOKIE\[)\s*["'][^"']*["']\s*\}?[^>]*>/,
+    example: '<div><?php echo "<h1>" . $_GET["content"] . "</h1>"; ?></div>'
   },
   
   // Pattern 4: Short echo tag with user input

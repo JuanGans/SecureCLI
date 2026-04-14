@@ -2,17 +2,26 @@
  * SQLi Finding Consolidator
  * Deduplicates and merges SQL injection findings from multiple engines
  * Prevents duplicate vulnerability reports for the same sink
+ * ENHANCED: Filters out XSS misclassifications
  */
 
 class SQLiConsolidator {
   /**
    * Consolidate SQLi findings - removes duplicates, keeps highest confidence
+   * ENHANCED: Separate XSS from SQLi findings
    * @param {Array} findings - All findings from different engines
    * @returns {Array} Deduplicated findings
    */
   static consolidate(findings) {
-    const sqliFindings = findings.filter(f => (f.type || '').toUpperCase().includes('SQLI'));
-    const nonSqli = findings.filter(f => !(f.type || '').toUpperCase().includes('SQLI'));
+    const sqliFindings = findings.filter(f => {
+      const type = (f.type || '').toUpperCase();
+      // Only include actual SQLi types
+      return type.includes('SQLI');
+    });
+    const nonSqli = findings.filter(f => {
+      const type = (f.type || '').toUpperCase();
+      return !type.includes('SQLI');
+    });
 
     const deduplicated = SQLiConsolidator.deduplicate(sqliFindings);
     return [...deduplicated, ...nonSqli];
@@ -48,6 +57,11 @@ class SQLiConsolidator {
    * Check if two findings reference the same vulnerability
    */
   static isSameFinding(a, b) {
+    // Ensure both are SQLi
+    if (!((a.type || '').includes('SQLI') && (b.type || '').includes('SQLI'))) {
+      return false;
+    }
+
     // Same line and same type
     if (a.line === b.line && a.type === b.type) return true;
 

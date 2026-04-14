@@ -2,17 +2,26 @@
  * XSS Finding Consolidator
  * Deduplicates and merges XSS findings from multiple engines
  * (Reflected, Stored, DOM-Based, Event Handler + Taint Analysis)
+ * ENHANCED: Filters out SQLi misclassifications
  */
 
 class XSSConsolidator {
   /**
    * Consolidate XSS findings - removes duplicates, keeps highest confidence
+   * ENHANCED: Only consolidate actual XSS findings
    * @param {Array} findings - All findings from different XSS engines
    * @returns {Array} Deduplicated findings
    */
   static consolidate(findings) {
-    const xssFindings = findings.filter(f => (f.type || '').toUpperCase().includes('XSS'));
-    const nonXss = findings.filter(f => !(f.type || '').toUpperCase().includes('XSS'));
+    const xssFindings = findings.filter(f => {
+      const type = (f.type || '').toUpperCase();
+      // Only include actual XSS types, NOT SQLi types
+      return type.includes('XSS') && !type.includes('SQLI');
+    });
+    const nonXss = findings.filter(f => {
+      const type = (f.type || '').toUpperCase();
+      return !type.includes('XSS') || type.includes('SQLI');
+    });
 
     const deduplicated = XSSConsolidator.deduplicate(xssFindings);
     return [...nonXss, ...deduplicated];
@@ -45,6 +54,14 @@ class XSSConsolidator {
    * Check if two XSS findings are the same vulnerability
    */
   static isSameFinding(a, b) {
+    // Ensure both are XSS and not SQLi
+    if (!((a.type || '').includes('XSS') && (b.type || '').includes('XSS'))) {
+      return false;
+    }
+    if ((a.type || '').includes('SQLI') || (b.type || '').includes('SQLI')) {
+      return false;
+    }
+
     // Same line - definitely same finding
     if (a.line === b.line) return true;
 

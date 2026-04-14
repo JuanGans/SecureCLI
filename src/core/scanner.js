@@ -368,7 +368,64 @@ class Scanner {
   }
 
   /**
+   * Distinguish between SQLi and XSS context based on code analysis
+   * Returns which vulnerability type is more likely
+   */
+  getVulnerabilityContext(content, lineNumber) {
+    const lines = content.split('\n');
+    const contextStart = Math.max(0, lineNumber - 5);
+    const contextEnd = Math.min(lines.length, lineNumber + 5);
+    const context = lines.slice(contextStart, contextEnd).join('\n');
+    
+    // SQL Keywords and patterns that indicate SQLi context
+    const sqlKeywords = /(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|JOIN|UNION|ORDER\s+BY|GROUP\s+BY|HAVING|CREATE|DROP|ALTER|EXEC|EXECUTE|QUERY|PREPARED|mysqli|mysql_query|pdo|prepared.*statement)/i;
+    const sqlOperators = /(\$_GET|\$_POST|\$_REQUEST).*["']\s*\.\s*["'](SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)/i;
+    const sqlInjectionPatterns = /(UNION\s+SELECT|OR\s+1\s*=\s*1|".*or.*")/i;
+    
+    // XSS Keywords and patterns that indicate XSS context
+    const xssKeywords = /(echo|print|innerHTML|innerText|document\.write|appendChild|insertBefore|addEventListener|onclick|onerror|onload|<script|<img|<iframe|<embed|htmlspecialchars|htmlentities|escape)/i;
+    const htmlTags = /<(?:script|iframe|embed|object|img|svg|style|link|form|input)\b[^>]*>/i;
+    const eventHandlers = /on(error|load|click|mouseover|focus|submit|change)\s*=/i;
+    
+    // Count indicators
+    let sqlScore = 0;
+    let xssScore = 0;
+    
+    // Check for SQL keywords
+    if (sqlKeywords.test(context)) sqlScore += 3;
+    if (sqlOperators.test(context)) sqlScore += 5;
+    if (sqlInjectionPatterns.test(context)) sqlScore += 4;
+    
+    // Check for XSS keywords
+    if (xssKeywords.test(context)) xssScore += 3;
+    if (htmlTags.test(context)) xssScore += 4;
+    if (eventHandlers.test(context)) xssScore += 3;
+    
+    // Check current line specifically
+    const currentLine = lines[lineNumber - 1] || '';
+    if (/SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|mysqli_query|mysql_query|pdo.*query/i.test(currentLine)) {
+      sqlScore += 2;
+    }
+    if (/echo|print|innerHTML|innerText|document\.write|addEventListener/i.test(currentLine)) {
+      xssScore += 2;
+    }
+    if (/<[a-z]/i.test(currentLine) && !/<[\s!]/i.test(currentLine)) {
+      xssScore += 1;
+    }
+    
+    return {
+      sqlScore,
+      xssScore,
+      isSQLi: sqlScore > xssScore,
+      isXSS: xssScore > sqlScore,
+      isMixed: sqlScore === xssScore && sqlScore > 0,
+      moreContext: { context, currentLine }
+    };
+  }
+
+  /**
    * Identify likely false positives to filter out
+   * ENHANCED: Better distinction between SQLi and XSS
    */
   isLikelyFalsePositive(regexFinding, content) {
     // Get the code line context
@@ -387,6 +444,23 @@ class Scanner {
 
     // Filter 3: Variable declarations in function/array context
     if (regexFinding.type === 'XSS_CONCAT' && /\[\s*['"]?\w+['"]?\s*\]\s*=\s*\$_(GET|POST|REQUEST)/.test(codeLine)) {
+      return true;
+    }
+
+    // Filter 4: XSS_DOM false positive - likely SQL comparison operators
+    // Pattern: `<` or `>` followed by SQL context (numbers, column names, keywords)
+    if (regexFinding.type === 'XSS_DOM' && /[<>]\s*(?:\d+|'[^']*'|"[^"]*"|SELECT|FROM|WHERE|AND|OR|IN)\b/i.test(codeLine)) {
+      // This looks like SQL comparison, not XSS
+      // Check if XSS is actually more likely
+      const vulnContext = this.getVulnerabilityContext(content, regexFinding.line);
+      if (vulnContext.isSQLi) {
+        this.logger.debug(`Filtering XSS_DOM at line ${regexFinding.line} - SQL context detected`);
+        return true;
+      }
+    }
+
+    // Filter 5: XSS_DOM false positive - HTML comment or documentation
+    if (regexFinding.type === 'XSS_DOM' && /\/\/|\/\*|<!--/.test(codeLine)) {
       return true;
     }
 

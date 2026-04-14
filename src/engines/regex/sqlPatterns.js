@@ -65,7 +65,8 @@ const XSS_PATTERNS = [
   {
     type: 'XSS_DOM',
     name: 'DOM-Based XSS',
-    regex: /<|>|<html|<body|<div|<h[1-6]|<p|<img|<iframe/i,
+    // More specific pattern to avoid matching SQL comparison operators
+    regex: /<(?:script|iframe|embed|object|img|svg|style|link|form|input)\b[^>]*>/i,
     severity: 'MEDIUM',
     confidence: 0.75,
     description: 'Detected HTML tag injection',
