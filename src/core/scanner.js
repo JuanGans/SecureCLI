@@ -66,8 +66,10 @@ class Scanner {
   /**
    * Scan a single file
    * ENHANCED: Multi-engine support for PHP with taint analysis
-   * - PHP: Regex + Static Taint Analysis + Multi-engine voting
+   * - PHP: Regex + Lexical (Tokenizer/AST) + Taint Analysis
    * - JavaScript/TypeScript: AST + Taint Analysis
+   * 
+   * OPTIMIZATION: For DVWA-like structures with wrapper files, skip wrapper and scan actual vulnerable files in /source/ subdirectory directly
    */
   scanFile(filePath) {
     try {
@@ -84,8 +86,61 @@ class Scanner {
           this.logger.warn(`AST parsing skipped for ${filePath}: ${astError.message}`);
         }
       } else if (language === 'php') {
-        // PHP files use multi-engine detection (Regex + Taint Analysis)
+        // PHP files use multi-engine detection (Regex + Taint Analysis + Lexical/AST)
         this.logger.info(`PHP file detected: ${filePath} (using multi-engine detection)`);
+        
+        // OPTIMIZATION: For wrapper files with /source/ subdirectory, scan source files directly
+        // This avoids false positives from wrapper orchestration logic
+        const fileName = path.basename(filePath).toLowerCase();
+        const isWrapperFile = fileName === 'index.php';
+        const parentDir = path.dirname(filePath);
+        const sourceDir = path.join(parentDir, 'source');
+        const hasSourceDir = fs.existsSync(sourceDir);
+        
+        if (isWrapperFile && hasSourceDir) {
+          this.logger.debug(`[WRAPPER DETECTION] Found /source/ subdirectory - will skip wrapper and scan actual vulnerable files`);
+          this.logger.debug(`[WRAPPER DETECTION] Source directory: ${sourceDir}`);
+          
+          try {
+            const sourceFiles = fs.readdirSync(sourceDir)
+              .filter(f => f.endsWith('.php'))
+              .map(f => path.join(sourceDir, f))
+              .sort(); // Scan in consistent order
+            
+            if (sourceFiles.length === 0) {
+              this.logger.debug(`[WRAPPER DETECTION] No PHP files in /source/ - fallback to wrapper`);
+              return this.detectPHPWithMultiEngine(filePath, content);
+            }
+            
+            this.logger.debug(`[WRAPPER DETECTION] Found ${sourceFiles.length} source files to scan`);
+            
+            // Scan each source file separately to maintain clean detection context
+            // All 3 engines (regex, lexical/AST, taint) will run on each source file
+            let phpFindings = [];
+            for (const sourceFile of sourceFiles) {
+              this.logger.debug(`[ENGINE: Regex+Lexical+Taint] Scanning: ${path.basename(sourceFile)}`);
+              const sourceContent = fs.readFileSync(sourceFile, 'utf-8');
+              const sourceFileFindings = this.detectPHPWithMultiEngine(sourceFile, sourceContent);
+              this.logger.debug(`[ENGINE: Regex+Lexical+Taint] Found ${sourceFileFindings.length} findings in ${path.basename(sourceFile)}`);
+              
+              // Ensure all findings have correct file path for source file
+              sourceFileFindings.forEach(f => {
+                f.file = sourceFile;
+              });
+              
+              phpFindings = phpFindings.concat(sourceFileFindings);
+            }
+            
+            return phpFindings;
+          } catch (err) {
+            this.logger.warn(`Failed to scan source files: ${err.message}`);
+            // Fallback to scanning wrapper if source scanning fails
+            return this.detectPHPWithMultiEngine(filePath, content);
+          }
+        }
+        
+        // Normal PHP file (not a wrapper) - scan directly
+        // All 3 engines (regex, lexical/AST, taint) will run
         return this.detectPHPWithMultiEngine(filePath, content);
       }
 
@@ -784,7 +839,8 @@ class Scanner {
       confidence: baseConfidence,
       exploitability,
       effectiveRisk: Math.max(0, riskScore - riskReduction),
-      file: undefined, // Will be set by scanner orchestrator
+      // Preserve file path if already set (e.g., for DVWA source files scanned from wrapper)
+      file: finding.file || finding.file, // Keep existing file path
     };
   }
 
@@ -847,6 +903,35 @@ class Scanner {
       cweName: mapping.name,
       cweUrl: `https://cwe.mitre.org/data/definitions/${mapping.cwe.split('-')[1]}.html`
     };
+  }
+
+  /**
+   * Resolve a PHP include path to an absolute filesystem path
+   * Handles relative paths, constants, and common patterns from DVWA
+   * @param {string} includePath - The path as written in the include statement
+   * @param {string} baseDir - Directory of the file doing the including
+   * @param {string} originalFilePath - Original file path for context
+   * @returns {string|null} Resolved absolute path, or null if can't resolve
+   */
+  resolveIncludePath(includePath, baseDir, originalFilePath) {
+    // Simple relative path
+    const resolvedPath = path.join(baseDir, includePath);
+    if (fs.existsSync(resolvedPath)) {
+      return path.normalize(resolvedPath);
+    }
+
+    // Try up 2 directories (common for DVWA structure)
+    const upPath = path.join(baseDir, '..', '..', includePath);
+    if (fs.existsSync(upPath)) {
+      return path.normalize(upPath);
+    }
+
+    // Absolute path
+    if (fs.existsSync(includePath)) {
+      return path.normalize(includePath);
+    }
+
+    return null;
   }
 }
 

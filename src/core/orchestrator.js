@@ -39,7 +39,11 @@ class Orchestrator {
         const fileFindings = this.scanner.scanFile(file);
 
         fileFindings.forEach(finding => {
-          finding.file = file;
+          // Only set file path if not already set by scanner
+          // (scanner sets correct path for source files when scanning DVWA-like wrappers)
+          if (!finding.file) {
+            finding.file = file;
+          }
           this.allFindings.push(finding);
         });
       });

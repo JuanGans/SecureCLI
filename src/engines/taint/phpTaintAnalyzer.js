@@ -268,31 +268,43 @@ class PHPTaintAnalyzer {
   trackAssignments(code) {
     const lines = code.split('\n');
     
-    // PHP sanitization functions
-    const sanitizationFunctions = [
-      'htmlspecialchars',
-      'htmlentities',
-      'addslashes',
+    // PHP sanitization functions - separated by context
+    // Proper SQL sanitizers: prevent SQL injection
+    const sqlSanitizers = [
       'mysqli_real_escape_string',
       'mysql_real_escape_string',
-      'filter_var',
-      'filter_input',
       'intval',
       'floatval',
-      'stripslashes',
-      'strip_tags',
-      'preg_replace',
-      'trim',
-      'escapeshellarg',
-      'escapeshellcmd'
+      'filter_var',
+      'filter_input'
     ];
+    
+    // Proper XSS sanitizers: prevent HTML/JavaScript injection
+    const xssSanitizers = [
+      'htmlspecialchars',
+      'htmlentities',
+      'strip_tags',
+      'filter_var',
+      'filter_input'
+    ];
+    
+    // Command sanitizers
+    const commandSanitizers = [
+      'escapeshellarg',
+      'escapeshellcmd',
+      'intval'
+    ];
+    
+    // NOT proper sanitizers (just formatting):
+    // - trim, stripslashes, strip_tags, preg_replace, addslashes (alone)
+    const allSanitizers = [...new Set([...sqlSanitizers, ...xssSanitizers, ...commandSanitizers])];
     
     // For each tainted variable, find where it's used in assignments
     for (const [varName, taintInfo] of this.taintedVariables.entries()) {
       lines.forEach((line, lineIndex) => {
         // Check if variable is sanitized (direct pattern)
         const sanitizationPattern = new RegExp(
-          `\\$([a-zA-Z_][a-zA-Z0-9_]*)\\s*=\\s*(${sanitizationFunctions.join('|')})\\s*\\([^)]*\\$${varName}[^)]*\\)`,
+          `\\$([a-zA-Z_][a-zA-Z0-9_]*)\\s*=\\s*(${allSanitizers.join('|')})\\s*\\([^)]*\\$${varName}[^)]*\\)`,
           'i'
         );
         const sanitizeMatch = sanitizationPattern.exec(line);
@@ -302,7 +314,7 @@ class PHPTaintAnalyzer {
         let ternarySanitizeMatch = null;
         if (!sanitizeMatch) {
           const ternaryPattern = new RegExp(
-            `\\$([a-zA-Z_][a-zA-Z0-9_]*)\\s*=\\s*\\(?\\(?[^;]*(${sanitizationFunctions.join('|')})\\s*\\([^)]*\\$${varName}`,
+            `\\$([a-zA-Z_][a-zA-Z0-9_]*)\\s*=\\s*\\(?\\(?[^;]*(${allSanitizers.join('|')})\\s*\\([^)]*\\$${varName}`,
             'i'
           );
           ternarySanitizeMatch = ternaryPattern.exec(line);
