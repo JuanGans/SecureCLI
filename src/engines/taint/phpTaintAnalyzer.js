@@ -12,11 +12,14 @@ class PHPTaintAnalyzer {
     this.dataFlows = [];                     // Complete flow chains
     this.findings = [];                      // Actual vulnerabilities found
     this.variableAssignments = new Map();   // Track variable assignments
+    this.rootCauseVulnerabilities = new Map(); // Track root cause findings
+    this.codePatternHash = new Map();       // Hash of code patterns to detect duplicates
   }
 
   /**
    * Analyze PHP code for taint flows
    * Returns vulnerabilities with complete chain proof
+   * ENHANCED: Root cause detection (query construction, output statement)
    */
   analyze(code, filePath = 'unknown') {
     try {
@@ -30,11 +33,17 @@ class PHPTaintAnalyzer {
       
       // Step 2.5: Re-check sanitization sufficiency for context
       this.validateSanitizationSufficiency(code);
+
+      // Step 2.8: Detect root causes NOW — after taint map is fully built
+      // This allows root cause detection to use actual taint data, not just heuristics
+      this.detectRootCauseSQLInjection(code);
+      this.detectRootCauseXSS(code);
       
       // Step 3: Find sinks and validate complete chains
       this.findSinksWithChains(code);
       
       // Step 4: Deduplicate findings (prevent same sink reported twice)
+      // ENHANCED: Now also deduplicates by code pattern similarity
       this.deduplicateFindings();
       
       return this.findings;
@@ -52,6 +61,375 @@ class PHPTaintAnalyzer {
     this.dataFlows = [];
     this.findings = [];
     this.variableAssignments.clear();
+    this.rootCauseVulnerabilities.clear();
+    this.codePatternHash.clear();
+  }
+
+  /**
+   * ENHANCED: Detect root cause SQL Injection
+   * Focus on query CONSTRUCTION with unsanitized input
+   * Pattern: $query = "... WHERE ... = '$variable' ..."
+   * This is the ROOT CAUSE, not the execution point
+   * NOW USES TAINT MAP for accurate detection
+   */
+  detectRootCauseSQLInjection(code) {
+    const lines = code.split('\n');
+    
+    // Pattern: $query = "... $variable ..." where variable is user input
+    const queryConstructionPatterns = [
+      // Double quotes with interpolation: $query = "SELECT ... WHERE id = '$id'"
+      /\$([a-zA-Z_]\w*)\s*=\s*"([^"]*\$([a-zA-Z_]\w*)[^"]*)"/gi,
+      // Concatenation with variable: $query = 'SELECT' . $var . 'WHERE'
+      // More flexible: allow multiple dots and strings around variable
+      /\$([a-zA-Z_]\w*)\s*=\s*["'].*?["']\s*\.\s*\$([a-zA-Z_]\w*)\s*\./gi,
+      // Concatenation ending with variable: $query = 'SELECT' . $var
+      /\$([a-zA-Z_]\w*)\s*=\s*["'][^"']*["']\s*\.\s*\$([a-zA-Z_]\w*)(?!\s*\.)/gi,
+      // Append operations: $query .= "text with $var" (double-quoted allows single quotes inside)
+      /\$([a-zA-Z_]\w*)\s*\.=\s*"([^"]*\$([a-zA-Z_]\w*)[^"]*)"/gi,
+      // Append operations: $query .= 'text with $var' (single-quoted)
+      /\$([a-zA-Z_]\w*)\s*\.=\s*'([^']*\$([a-zA-Z_]\w*)[^']*)'/gi,
+      // Direct variable append: $query .= $var
+      /\$([a-zA-Z_]\w*)\s*\.=\s*\$([a-zA-Z_]\w*)/gi,
+    ];
+
+    lines.forEach((line, lineIndex) => {
+      // Check for query construction patterns
+      for (const pattern of queryConstructionPatterns) {
+        pattern.lastIndex = 0; // BUG FIX #1: Reset lastIndex setiap baris untuk avoid state bleeding
+        let match;
+        while ((match = pattern.exec(line)) !== null) {
+          const queryVarName = match[1]; // e.g., 'query'
+          // Extract user variable: for patterns with interpolation it's match[3], for concat it's match[2]
+          let userVariable = match[3] || match[2];
+          const queryContent = match[2] || '';
+
+          // Skip if no user variable extracted
+          if (!userVariable) continue;
+
+          // BUG FIX #2: Capture ALL $variables dalam query string, bukan hanya yang pertama
+          // Contoh: INSERT INTO t VALUES ('$message','$name') — cek keduanya!
+          const allVarsInQuery = [...(queryContent || '').matchAll(/\$([a-zA-Z_]\w*)/g)].map(m => m[1]);
+          if (allVarsInQuery.length > 1) {
+            // Multiple variables: check each one to find the FIRST vulnerable one
+            let foundVulnerable = false;
+            for (const varToCheck of allVarsInQuery) {
+              if (this.isTaintedVariable(varToCheck) && !foundVulnerable) {
+                userVariable = varToCheck;
+                foundVulnerable = true;
+                break;
+              }
+            }
+            // If no tainted found via map, use the first one (heuristic fallback)
+            if (!foundVulnerable && allVarsInQuery.length > 0) {
+              userVariable = allVarsInQuery[0];
+            }
+          }
+
+          // Check if this is actually a query (contains SQL keywords)
+          const fullLine = line;
+          if (!/(WHERE|INSERT|UPDATE|DELETE|SELECT|FROM|SET\s|VALUES)/i.test(fullLine) &&
+              !/(WHERE|INSERT|UPDATE|DELETE|SELECT|FROM|SET\s|VALUES)/i.test(queryContent)) {
+            continue;
+          }
+
+          // PRIMARY CHECK: use taint map (accurate — set by extractSources/trackAssignments)
+          // FALLBACK: heuristic name-based check
+          const isTaintedVar = userVariable && this.isTaintedVariable(userVariable);
+          const isDirectSuperglobal = /\$_(GET|POST|REQUEST|COOKIE|SESSION|ENV|FILES)/.test(line);
+          const isHeuristicInput = !isTaintedVar && this._isLikelyUserInput(userVariable);
+          
+          // CRITICAL FIX: Check if variable is SQL-escaped but not parameterized
+          // e.g., mysqli_real_escape_string() is NOT equivalent to prepared statements
+          // So even if isTaintedVar is false, we need to check if it's using SQL escape functions
+          const isSQLEscapedButNotParameterized = !isTaintedVar && userVariable && 
+            this.taintedVariables.has(userVariable) && 
+            this.taintedVariables.get(userVariable).sanitizedBy &&
+            ['mysqli_real_escape_string', 'mysql_real_escape_string'].includes(
+              this.taintedVariables.get(userVariable).sanitizedBy
+            );
+          
+          const isUserInput = isTaintedVar || isDirectSuperglobal || isHeuristicInput || isSQLEscapedButNotParameterized;
+
+          if (isUserInput && !this._hasParameterization(queryContent || line)) {
+            // Generate hash from normalized line (more accurate than just queryContent)
+            const patternHash = this._generatePatternHash(line);
+            
+            // Check for duplicates
+            if (this.rootCauseVulnerabilities.has(patternHash)) {
+              continue;
+            }
+
+            this.rootCauseVulnerabilities.set(patternHash, true);
+            this.codePatternHash.set(patternHash, {
+              pattern: line.trim().substring(0, 60),
+              lines: [lineIndex + 1]
+            });
+
+            // Get actual source type from taint map if available
+            const taintInfo = userVariable && this.taintedVariables.get(userVariable);
+            const actualSourceType = taintInfo ? taintInfo.sourceType : 'USER_INPUT';
+            
+            // Determine confidence and description based on detection method
+            let confidence, detectionMethod, description, sanitizationNote;
+            if (isTaintedVar) {
+              confidence = 0.97;
+              detectionMethod = 'taint_map';
+              description = `Query variable \`${queryVarName}\` constructed with unsanitized user input \`${userVariable}\` via string interpolation. No parameterization detected.`;
+              sanitizationNote = null;
+            } else if (isDirectSuperglobal) {
+              confidence = 0.95;
+              detectionMethod = 'direct_superglobal';
+              description = `Query variable \`${queryVarName}\` contains superglobal directly in string interpolation. No parameterization detected.`;
+              sanitizationNote = null;
+            } else if (isSQLEscapedButNotParameterized) {
+              confidence = 0.88; // Lower confidence - escaped but not parameterized
+              detectionMethod = 'sql_escaped_not_parameterized';
+              const sanitizeFunc = taintInfo.sanitizedBy;
+              description = `Query variable \`${queryVarName}\` uses ${sanitizeFunc}() which provides SQL escaping but NOT equivalent to prepared statements. String interpolation with escaped user input can still be vulnerable in edge cases (e.g., numeric contexts, multi-byte character attacks).`;
+              sanitizationNote = `Sanitized with ${sanitizeFunc}() - insufficient for SQL context`;
+            } else {
+              confidence = 0.80;
+              detectionMethod = 'heuristic';
+              description = `Query variable \`${queryVarName}\` constructed with heuristically-detected user input \`${userVariable}\` via string interpolation. No parameterization detected.`;
+              sanitizationNote = null;
+            }
+
+            this.findings.push({
+              type: 'SQLI_ROOT_CAUSE',
+              name: `SQL Injection Root Cause: Unsanitized query construction`,
+              severity: 'CRITICAL',
+              confidence,
+              line: lineIndex + 1,
+              variable: queryVarName,
+              sink: 'Query construction via string interpolation/concatenation',
+              sourceType: actualSourceType,
+              vulnerableVariable: userVariable,
+              description,
+              sanitizationNote,
+              recommendation: 'Use prepared statements with ? placeholders or named parameters',
+              patternHash: patternHash,
+              codeSnippet: line.trim(),
+              isRootCause: true,
+              detectionMethod,
+              proof: {
+                source: actualSourceType,
+                sink: 'Query construction',
+                propagation: [userVariable, queryVarName],
+                vulnerability_confirmed: isTaintedVar || isDirectSuperglobal || isSQLEscapedButNotParameterized
+              }
+            });
+          }
+        }
+      }
+    });
+  }
+
+  /**
+   * ENHANCED: Detect root cause XSS
+   * Focus on OUTPUT operations without encoding
+   * Pattern: echo, print, .= with unsanitized variable in HTML context
+   * This is the ROOT CAUSE (unescaped output)
+   * NOW USES TAINT MAP for accurate detection
+   */
+  detectRootCauseXSS(code) {
+    const lines = code.split('\n');
+    
+    // Patterns for direct output without encoding
+    const outputPatterns = [
+      // echo/print with string containing $var: echo "<p>$name</p>"
+      /(?:echo|print)\s+["'][^"']*\$([a-zA-Z_]\w*)[^"']*["']/gi,
+      // echo/print with {$var}: echo "<p>{$name}</p>"
+      /(?:echo|print)\s+["'][^"']*\{\$([a-zA-Z_]\w*)\}[^"']*["']/gi,
+      // .= concatenation: $html .= "<tag>$var</tag>" or "<tag>{$var}</tag>"
+      /\$([a-zA-Z_]\w*)\s*\.=\s*["'][^"']*\$([a-zA-Z_]\w*)[^"']*["']/gi,
+      // .= with {$var} interpolation: $html .= "<pre>ID: {$var}"
+      /\$([a-zA-Z_]\w*)\s*\.=\s*["'][^"']*\{\$([a-zA-Z_]\w*)\}[^"']*["']/gi,
+      // .= concatenation with dot operator: $html .= '<p>' . $_GET['name'] . '</p>'
+      /\$([a-zA-Z_]\w*)\s*\.=\s*['"][^'"]*['"]\s*\.\s*\$_([A-Z_]+)/gi,
+      // .= concatenation with dot and variable: $var .= '<p>' . $data . '</p>'
+      /\$([a-zA-Z_]\w*)\s*\.=\s*['"][^'"]*['"]\s*\.\s*\$([a-zA-Z_]\w*)/gi,
+    ];
+
+    lines.forEach((line, lineIndex) => {
+      // Skip lines with proper encoding
+      if (/htmlspecialchars|htmlentities|htmlescape|escape|sanitize/i.test(line)) {
+        return;
+      }
+
+      for (const pattern of outputPatterns) {
+        pattern.lastIndex = 0; // BUG FIX #1: Reset lastIndex setiap baris untuk avoid state bleeding
+        let match;
+        while ((match = pattern.exec(line)) !== null) {
+          // Determine which group contains the variable
+          let outputVar;
+          let outputStatement;
+          let sourceType;
+          
+          const isEchoLine = /^\s*(?:echo|print)\s/i.test(line);
+          if (isEchoLine) {
+            // echo/print: match[1] = variable name (without $)
+            outputVar = match[1];
+            outputStatement = line.match(/(?:echo|print)/i)?.[0] || 'echo';
+          } else if (match[2] && ['GET', 'POST', 'REQUEST', 'COOKIE', 'SESSION', 'ENV', 'FILES', 'SERVER'].includes(match[2])) {
+            // .= concatenation with superglobal: match[2] = GET/POST/etc
+            outputVar = '_' + match[2] + '_direct';  // Virtual variable for direct superglobal
+            sourceType = this.getSourceType('$_' + match[2]);
+            outputStatement = '.= (concat with $_' + match[2] + ')';
+          } else if (match[2]) {
+            // .= concatenation: match[1] = output var, match[2] = tainted var
+            outputVar = match[2];
+            outputStatement = '.=';
+          } else if (match[1]) {
+            outputVar = match[1];
+            outputStatement = '.=';
+          } else {
+            continue;
+          }
+          
+          // Cleanup: remove $ prefix if accidentally included
+          if (outputVar && outputVar.startsWith('$')) {
+            outputVar = outputVar.substring(1);
+          }
+
+          // PRIMARY CHECK: use taint map — is this variable actually tainted?
+          // FALLBACK: heuristic name-based check
+          const isTaintedVar = this.isTaintedVariable(outputVar);
+          const isDirectSuperglobal = /\$_(GET|POST|REQUEST|COOKIE|SESSION|ENV|FILES)/.test(line);
+          const isHeuristicInput = !isTaintedVar && this._isLikelyUserInput(outputVar);
+          const isUserInput = isTaintedVar || isDirectSuperglobal || isHeuristicInput;
+          
+          if (isUserInput) {
+            // Hash from full normalized line — catches duplicates across MySQL/SQLite blocks
+            const patternHash = this._generatePatternHash(line);
+            const hashKey = 'XSS_' + patternHash;
+
+            // Avoid duplicates
+            if (this.rootCauseVulnerabilities.has(hashKey)) {
+              continue;
+            }
+
+            this.rootCauseVulnerabilities.set(hashKey, true);
+            this.codePatternHash.set(hashKey, {
+              pattern: line.trim().substring(0, 60),
+              lines: [lineIndex + 1]
+            });
+
+            // Get actual source type from taint map if available
+            const taintInfo = this.taintedVariables.get(outputVar);
+            const actualSourceType = sourceType || (taintInfo ? taintInfo.sourceType : 'USER_INPUT');
+            const confidence = isTaintedVar ? 0.95 : isDirectSuperglobal ? 0.92 : 0.75;
+
+            this.findings.push({
+              type: 'XSS_ROOT_CAUSE',
+              name: `XSS Root Cause: Unescaped output in HTML context`,
+              severity: 'HIGH',
+              confidence,
+              line: lineIndex + 1,
+              variable: outputVar,
+              sink: outputStatement,
+              sourceType: actualSourceType,
+              description: `Variable \`${outputVar}\` output directly to HTML via ${outputStatement} without htmlspecialchars() or equivalent encoding.`,
+              recommendation: 'Wrap user input with htmlspecialchars($' + outputVar + ', ENT_QUOTES, "UTF-8")',
+              patternHash: hashKey,
+              codeSnippet: line.trim(),
+              isRootCause: true,
+              detectionMethod: isTaintedVar ? 'taint_map' : isDirectSuperglobal ? 'direct_superglobal' : 'heuristic',
+              proof: {
+                source: actualSourceType,
+                sink: 'HTML output',
+                propagation: [outputVar],
+                vulnerability_confirmed: isTaintedVar || isDirectSuperglobal
+              }
+            });
+          }
+        }
+      }
+    });
+  }
+
+  /**
+   * Helper: Generate hash of code pattern to detect duplicates
+   * Uses simplified pattern, ignoring variable names
+   */
+  _generatePatternHash(codeSnippet) {
+    // Normalize: remove specific variable names, keep structure
+    const normalized = codeSnippet
+      .replace(/\$[a-zA-Z_]\w*/g, '$VAR')          // Replace all variables with $VAR
+      .replace(/['"][^'"]*['"]/g, '"STR"')          // Replace all strings with "STR"
+      .replace(/\d+/g, 'NUM')                        // Replace numbers with NUM
+      .toLowerCase()
+      .trim();
+    
+    // Simple hash
+    let hash = 0;
+    for (let i = 0; i < normalized.length; i++) {
+      const char = normalized.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32-bit integer
+    }
+    return 'pattern_' + Math.abs(hash);
+  }
+
+  /**
+   * Helper: Check if variable is likely user input
+   */
+  _isLikelyUserInput(varName) {
+    if (!varName) return false;
+    
+    // ONLY skip heuristic if variable is explicitly marked as SANITIZED
+    // If it's in taint map but NOT sanitized, let the heuristic provide fallback confidence
+    if (this.taintedVariables && this.taintedVariables.has(varName)) {
+      const taintInfo = this.taintedVariables.get(varName);
+      // Return false (skip heuristic) ONLY if sanitized — we already have proof from taint map
+      if (taintInfo.isSanitized || taintInfo.type === 'SANITIZED') {
+        return false; // It's been properly sanitized, not user input
+      }
+      // If it's in map but NOT sanitized, continue to heuristic check
+      // This gives heuristic a chance to provide additional detection signal
+    }
+    
+    // Variables that commonly hold user input in PHP apps
+    // Expanded from DVWA-only to general PHP app patterns
+    const userInputPatterns = [
+      // Identity / common input fields
+      'id', 'uid', 'userid', 'user_id',
+      'name', 'username', 'uname', 'login',
+      'email', 'mail',
+      'password', 'passwd', 'pass', 'pwd',
+      // Search / query
+      'query', 'search', 'q', 'keyword', 'term', 'filter',
+      'sql', 'stmt',
+      // Generic input
+      'input', 'data', 'val', 'value', 'param', 'arg',
+      'content', 'body', 'text', 'msg', 'message',
+      // Names
+      'first', 'last', 'fname', 'lname', 'fullname',
+      'title', 'subject', 'comment',
+      // System / command
+      'cmd', 'command', 'exec', 'path', 'file', 'filename',
+      'url', 'uri', 'redirect', 'target', 'dest',
+      // Misc
+      'key', 'token', 'code', 'hash', 'ref',
+      'order', 'sort', 'page', 'limit', 'offset',
+    ];
+
+    const lowerName = varName.toLowerCase();
+    return userInputPatterns.some(pattern => lowerName.includes(pattern));
+  }
+
+  /**
+   * Helper: Check if query uses parameterization
+   */
+  _hasParameterization(queryContent) {
+    // Check for parameterized query patterns
+    const paramPatterns = [
+      /\?/,                    // ? placeholder
+      /:\w+/,                  // :name placeholder
+      /\$\d+/,                 // $1, $2 placeholder
+      /prepared|parameterized|prepare|bind/i  // Prepared statement keywords
+    ];
+
+    return paramPatterns.some(pattern => pattern.test(queryContent));
   }
 
   /**
@@ -388,6 +766,31 @@ class PHPTaintAnalyzer {
         }
       });
     }
+
+    // BUG FIX #3: DB Fetch Propagation — $row = mysqli_fetch_assoc($result) inherits taint from $result
+    // This fixes detection of XSS in display code using $row['column']
+    lines.forEach((line, lineIndex) => {
+      const dbFetchPat = /\$(\w+)\s*=\s*(mysqli_fetch_assoc|mysqli_fetch_array|fetch_assoc|fetchArray)\s*\(\s*\$(\w+)/i;
+      const dbm = dbFetchPat.exec(line);
+      if (dbm && this.isTaintedVariable(dbm[3])) {
+        const rowVar = dbm[1];
+        const resultVar = dbm[3];
+        const resultTaint = this.taintedVariables.get(resultVar);
+        
+        if (!this.taintedVariables.has(rowVar)) {
+          this.taintedVariables.set(rowVar, {
+            type: 'DB_PROPAGATED',
+            sourceType: resultTaint.sourceType,
+            severity: 'HIGH',
+            line: lineIndex + 1,
+            context: 'db_fetch_row',
+            chain: [...(resultTaint.chain || [resultVar]), rowVar],
+            isDbRow: true,
+            originalSource: resultTaint.superglobal
+          });
+        }
+      }
+    });
   }
 
   /**
@@ -737,11 +1140,32 @@ class PHPTaintAnalyzer {
   /**
    * Step 4: Deduplicate findings
    * Removes duplicate findings for the same vulnerability (same sink call)
+   * ENHANCED: Also uses pattern hash to detect code duplicates in different blocks
    */
   deduplicateFindings() {
     const unique = [];
+    const patternsSeen = new Map(); // Track patterns to eliminate duplicates
 
     for (const finding of this.findings) {
+      // Check by pattern hash first (detects duplicates like XSS in MySQL and SQLite blocks)
+      if (finding.patternHash) {
+        if (patternsSeen.has(finding.patternHash)) {
+          // Duplicate pattern found - skip or merge with higher confidence
+          const existingIdx = patternsSeen.get(finding.patternHash);
+          if (finding.confidence > unique[existingIdx].confidence) {
+            unique[existingIdx] = { 
+              ...finding, 
+              engines: this._mergeEngines(unique[existingIdx], finding),
+              duplicateCount: (unique[existingIdx].duplicateCount || 1) + 1,
+              allLines: [...(unique[existingIdx].allLines || []), finding.line]
+            };
+          }
+          continue;
+        }
+        patternsSeen.set(finding.patternHash, unique.length);
+      }
+
+      // Then check by traditional logic for non-pattern findings
       const duplicateIdx = unique.findIndex(existing =>
         this._isSameFinding(existing, finding)
       );
@@ -750,7 +1174,12 @@ class PHPTaintAnalyzer {
         unique.push(finding);
       } else if (finding.confidence > unique[duplicateIdx].confidence) {
         // Keep higher confidence, merge
-        unique[duplicateIdx] = { ...finding, engines: this._mergeEngines(unique[duplicateIdx], finding) };
+        unique[duplicateIdx] = { 
+          ...finding, 
+          engines: this._mergeEngines(unique[duplicateIdx], finding),
+          duplicateCount: (unique[duplicateIdx].duplicateCount || 1) + 1,
+          allLines: [...(unique[duplicateIdx].allLines || []), finding.line]
+        };
       }
     }
 
@@ -759,19 +1188,36 @@ class PHPTaintAnalyzer {
 
   /**
    * Check if two findings refer to the same vulnerability
+   * ENHANCED: Now prioritizes root cause findings and considers pattern similarity
    */
   _isSameFinding(a, b) {
-    // Same type category
+    // Different vulnerability types - definitely not the same
     const categoryA = (a.type || '').split('_')[0];
     const categoryB = (b.type || '').split('_')[0];
     if (categoryA !== categoryB) return false;
 
+    // If both are root cause findings with same pattern hash, they're the same
+    if (a.isRootCause && b.isRootCause && a.patternHash && a.patternHash === b.patternHash) {
+      return true;
+    }
+
     // Same line and same type
     if (a.line === b.line && a.type === b.type) return true;
 
-    // Same sink on nearby lines
+    // Same vulnerable variable in same vulnerability type
+    if (a.variable && b.variable && a.variable === b.variable) {
+      if (a.type === b.type) {
+        return true;
+      }
+    }
+
+    // Same sink on nearby lines - only merge if root cause detection
     if (a.sink && b.sink && a.sink === b.sink) {
-      if (Math.abs((a.line || 0) - (b.line || 0)) <= 5) return true;
+      if (Math.abs((a.line || 0) - (b.line || 0)) <= 5) {
+        // For execution points, don't merge - keep both
+        // For root causes, merge
+        return a.isRootCause && b.isRootCause;
+      }
     }
 
     // Same proof sink

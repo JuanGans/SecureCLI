@@ -38,15 +38,96 @@ class MultiEngineDetector {
     // Engine 1: Regex patterns (fast, but false positives)
     const regexEngine = require('./regex/regexEngine');
     const regex = new regexEngine();
-    this.regexFindings = regex.scanFile(filePath, code);
+    this.regexFindings = regex.scan(code, 'php');
 
     // Engine 2: Static Taint Analysis (accurate, but slower)
     const PHPTaintAnalyzer = require('./taint/phpTaintAnalyzer');
     const taintAnalyzer = new PHPTaintAnalyzer();
     this.taintFindings = taintAnalyzer.analyze(code, filePath);
 
+    // BUG FIX #4: DOM XSS Detection - analyze inline JavaScript in PHP files
+    // This catches DOM-based XSS that pure PHP taint analysis cannot detect
+    const inlineJSFindings = this._detectDOMBasedXSSInPHP(code, filePath);
+    this.taintFindings = this.taintFindings.concat(inlineJSFindings);
+
     // Consolidate and validate findings
     return this.consolidateFindings(filePath);
+  }
+
+  /**
+   * BUG FIX #4: Detect DOM-based XSS in inline JavaScript within PHP files
+   * JavaScript DOM operations like document.write, innerHTML cannot be tracked by PHP taint analysis
+   * This method extracts inline JS and analyzes it separately
+   */
+  _detectDOMBasedXSSInPHP(code, filePath) {
+    const findings = [];
+    
+    // Extract inline JavaScript blocks from PHP
+    // Pattern: <script>...JS code...</script>
+    const scriptBlockRegex = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+    const TaintAnalyzer = require('./taint/TaintAnalyzer');
+    const jsAnalyzer = new TaintAnalyzer();
+    
+    let match;
+    let blockNumber = 0;
+    while ((match = scriptBlockRegex.exec(code)) !== null) {
+      const jsCode = match[1];
+      blockNumber++;
+      
+      // Skip if this block appears to be external (src attribute)
+      if (match[0].includes('src=')) continue;
+      
+      // Analyze this JS block for taint flow
+      try {
+        const jsFindings = jsAnalyzer.analyze(jsCode);
+        
+        // Convert JS findings to PHP context and add to results
+        for (const jsF of jsFindings) {
+          findings.push({
+            ...jsF,
+            type: 'XSS_DOM_BASED',
+            name: 'DOM-based XSS in inline JavaScript',
+            context: `Inline <script> block #${blockNumber}`,
+            sourceLanguage: 'JavaScript',
+            severity: 'HIGH',
+            isRootCause: true, // DOM XSS is inherently a root cause
+            detectionMethod: 'javascript_ast',
+            description: `DOM operation (${jsF.description || 'document.write/innerHTML'}) uses tainted JavaScript variable without sanitization`
+          });
+        }
+      } catch (error) {
+        // Silent fail for JS parsing errors - don't break PHP analysis
+        continue;
+      }
+    }
+    
+    // Also check for PHP echo with JS in string containing variables
+    // Pattern: echo "<script>...var = <?php echo $var ?> ...</script>"
+    const phpEchoJSPattern = /echo\s+["']<script>[^<]*\$\w+[^<]*<\/script>["']/gi;
+    const phpEchoMatches = [...code.matchAll(phpEchoJSPattern)];
+    
+    for (const phpMatch of phpEchoMatches) {
+      const line = phpMatch[0];
+      const varMatch = /\$([a-zA-Z_]\w*)/.exec(line);
+      
+      if (varMatch) {
+        findings.push({
+          type: 'XSS_DOM_BASED',
+          name: 'Potential DOM XSS via PHP-generated JavaScript',
+          severity: 'HIGH',
+          confidence: 0.85,
+          variable: varMatch[1],
+          sink: 'echo (into JavaScript context)',
+          sourceType: 'USER_INPUT',
+          isRootCause: true,
+          detectionMethod: 'php_to_js_transition',
+          description: `PHP variable \`${varMatch[1]}\` echoed into JavaScript context without escaping. May be vulnerable to DOM XSS if used in unsafe JS operations.`,
+          recommendation: 'Use json_encode() or javascript-specific escaping before output to JS context'
+        });
+      }
+    }
+    
+    return findings;
   }
 
   /**
@@ -62,25 +143,50 @@ class MultiEngineDetector {
   /**
    * Consolidate findings from multiple engines
    * Algorithm:
-   * 1. Start with taint analysis findings (high confidence, proven chains)
-   * 2. Match regex findings with taint findings (boost confidence if both agree)
-   * 3. Flag regex-only findings with lower confidence (unconfirmed sources)
-   * 4. Remove obvious false positives
+   * 1. Start with ROOT CAUSE findings (highest priority)
+   * 2. Add taint analysis findings (high confidence, proven chains)
+   * 3. Match regex findings with taint findings (boost confidence if both agree)
+   * 4. Flag regex-only findings with lower confidence (unconfirmed sources)
+   * 5. Remove obvious false positives
+   * 6. Deduplicate similar execution points when root cause exists
    */
   consolidateFindings(filePath) {
     const consolidated = [];
     const processedRegexIds = new Set();
 
-    // PHASE 1: Add taint analysis findings (highest confidence)
-    for (const taintFinding of this.taintFindings) {
+    // PHASE 0: Prioritize ROOT CAUSE findings (e.g., query construction, unescaped output)
+    const rootCauseFindings = this.taintFindings.filter(f => f.isRootCause);
+    const executionPointFindings = this.taintFindings.filter(f => !f.isRootCause);
+
+    // Add root cause findings first
+    for (const rootCauseFinding of rootCauseFindings) {
       consolidated.push({
-        ...taintFinding,
+        ...rootCauseFinding,
         engine: 'TAINT_ANALYSIS',
         engines: ['TAINT_ANALYSIS'],
-        confidence: taintFinding.confidence || 0.95,
+        confidence: rootCauseFinding.confidence || 0.95,
         isConfirmedVulnerability: true,
-        reason: 'Proven data flow from source to sink'
+        reason: 'Root cause detected: ' + (rootCauseFinding.vulnerability_type || 'vulnerability construction')
       });
+    }
+
+    // PHASE 1: Add execution point findings only if no matching root cause exists
+    for (const executionFinding of executionPointFindings) {
+      // Check if there's a matching root cause for this execution point
+      const hasMatchingRootCause = rootCauseFindings.some(rcf =>
+        this._isRelatedToRootCause(executionFinding, rcf)
+      );
+
+      if (!hasMatchingRootCause) {
+        consolidated.push({
+          ...executionFinding,
+          engine: 'TAINT_ANALYSIS',
+          engines: ['TAINT_ANALYSIS'],
+          confidence: executionFinding.confidence || 0.95,
+          isConfirmedVulnerability: true,
+          reason: 'Proven data flow from source to sink'
+        });
+      }
     }
 
     // PHASE 2: Match regex findings with taint findings
@@ -124,8 +230,13 @@ class MultiEngineDetector {
       }
     }
 
-    // PHASE 4: Sort by severity and line number
+    // PHASE 4: Sort by priority (root cause > execution point), then severity and line number
     consolidated.sort((a, b) => {
+      // Root cause findings come first
+      if (a.isRootCause && !b.isRootCause) return -1;
+      if (!a.isRootCause && b.isRootCause) return 1;
+
+      // Then sort by severity
       const severityOrder = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
       const aScore = (severityOrder[a.severity] || 4) * 10000 + (a.line || 0);
       const bScore = (severityOrder[b.severity] || 4) * 10000 + (b.line || 0);
@@ -134,6 +245,33 @@ class MultiEngineDetector {
 
     this.consolidatedFindings = consolidated;
     return consolidated;
+  }
+
+  /**
+   * Check if execution point finding is related to a root cause finding
+   * (e.g., same vulnerable variable)
+   */
+  _isRelatedToRootCause(executionFinding, rootCauseFinding) {
+    // Same vulnerability type
+    if ((executionFinding.type || '').split('_')[0] !== (rootCauseFinding.type || '').split('_')[0]) {
+      return false;
+    }
+
+    // Same variable
+    if (executionFinding.variable === rootCauseFinding.variable) {
+      return true;
+    }
+
+    // Vulnerable variable mentioned in root cause
+    if (rootCauseFinding.vulnerableVariable && executionFinding.variable === rootCauseFinding.vulnerableVariable) {
+      return true;
+    }
+
+    // Same variable name in chain
+    const execChain = executionFinding.chain || [];
+    const rootChain = rootCauseFinding.chain || [];
+    const commonVars = execChain.filter(v => rootChain.includes(v));
+    return commonVars.length > 0;
   }
 
   /**
