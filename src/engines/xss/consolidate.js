@@ -62,9 +62,12 @@ class XSSConsolidator {
       return false;
     }
 
-    // Same line - definitely same finding
-    if (a.line === b.line) return true;
 
+    // STRICT: Same file + same line - definitely same finding
+    if (a.file === b.file && a.line === b.line) {
+      console.log(`[XSS-DEDUP] Duplicate found at ${a.file}:${a.line}`);
+      return true;
+    }
     // Same variable and nearby lines
     if (a.variable && b.variable && a.variable === b.variable) {
       if (Math.abs((a.line || 0) - (b.line || 0)) <= 3) return true;

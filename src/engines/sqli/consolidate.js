@@ -62,9 +62,18 @@ class SQLiConsolidator {
       return false;
     }
 
-    // Same line and same type
-    if (a.line === b.line && a.type === b.type) return true;
 
+    // STRICT: Same file + same line + same type → DEFINITELY same
+    if (a.file === b.file && a.line === b.line && a.type === b.type) {
+      console.log(`[SQLI-DEDUP] Duplicate found at ${a.file}:${a.line}`);
+      return true;
+    }
+    
+    // STRICT: Same file + same line (different types but both SQLi) → LIKELY same
+    if (a.file === b.file && a.line === b.line) {
+      console.log(`[SQLI-DEDUP] Same line different type at ${a.file}:${a.line}`);
+      return true;
+    }
     // Same sink function and nearby lines (within 5 lines)
     if (a.sink && b.sink && a.sink === b.sink) {
       if (Math.abs((a.line || 0) - (b.line || 0)) <= 5) return true;
